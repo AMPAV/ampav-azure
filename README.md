@@ -1,2 +1,2 @@
-# ampav-whisper
-Whisper tools for the AMPAV Environment
+# ampav-azure
+Microsoft Azure tools for the AMPAV Environment

@@ -25,7 +25,7 @@ Issues = "https://github.com/AMPAV/ampav-azure/issues"
 
 
 [project.scripts]
-amapv_whisper_transcribe = "ampav.parakeet.transcribe:cli_whisper_transcribe"
+
 
 [build-system]
 requires = ["setuptools"]

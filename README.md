@@ -1,2 +1,2 @@
-# ampav-azure
-Azure-related services
+# ampav-whisper
+Whisper tools for the AMPAV Environment

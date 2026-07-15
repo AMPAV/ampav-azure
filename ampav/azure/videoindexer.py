@@ -1,21 +1,30 @@
 #!/bin/env python3.12
+from typing import Any
+
+from pydantic import ConfigDict
+
 from ampav.core.logging import LOG_FORMAT
+from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode
 import argparse
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
-import boto3
 import logging
 import os
 import requests
 import time
-from .vi_models import JobStatus
+
+from ampav.core.schema.basemodel import AmpAVBaseModel
+from ampav.core.schema.tool import ToolOutput
+from .vi_models import JobStatus, RawVideoIndexer, JobState
 from urllib.parse import urlparse
 import yaml
+import json
+
 
 # chunks shamelessly stolen from 
 # https://github.com/Azure-Samples/azure-video-indexer-samples/blob/master/API-Samples/Python/
 
 
-class AzureVideoIndexer:
+class AzureVideoIndexer(AsyncTool):
     def __init__(self, vi_subscription_id: str, vi_resource_group: str, 
                  vi_account_name: str,
                  azure_tenant_id: str=None, azure_client_id: str=None,
@@ -35,8 +44,6 @@ class AzureVideoIndexer:
             if not self.credential:
                 raise Exception("Cannot validate credentials")
             
-            self.get_access_token()
-
             # initialize the rest of state
             self.vi_subscription_id: str = vi_subscription_id
             self.vi_resource_group: str = vi_resource_group
@@ -45,9 +52,11 @@ class AzureVideoIndexer:
             self.auth_token: str = None
             self.api_url_base: str = None
 
+            self._get_access_token()
+
             
             
-    def get_access_token(self):
+    def _get_access_token(self):
         """Get the authentication token, regenerating it if needed"""
         if time.time() > self.auth_token_expire or self.auth_token is None:
             logging.debug("Requesting new auth token")
@@ -86,11 +95,8 @@ class AzureVideoIndexer:
         return self.auth_token        
             
             
-    def submit(self, video_url: str, **kwargs):
+    def submit(self, video_url: str, **kwargs) -> str:
         """Submit a job to AVI and return the job id"""        
-        parsed_url = urlparse(video_url)
-        if not parsed_url.scheme or not parsed_url.netloc:
-            raise ValueError("URL must be a network url")
         
         # submit the job.      
         submit_url = self.api_url_base + "/Videos"
@@ -102,27 +108,34 @@ class AzureVideoIndexer:
         # if videoUrl is not specified, the file can be sent as multipart/form body
         # fileName
 
-        r = requests.post(submit_url,
-                            params={
-                            'name': video_url.rsplit('/', 1)[-1] + "-" + str(int(time.time())),
-                            'accessToken': self.get_access_token(),
-                            'videoUrl': video_url,
-                            **kwargs
-                            })
+        params = {'name': video_url.rsplit('/', 1)[-1],
+                  'accessToken': self._get_access_token(),
+                  **kwargs}
+                            
+        parsed_url = urlparse(video_url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            # this is a local URL, so it can be sent as multipart/form body
+            with open(parsed_url.path, "rb") as f:
+                r = requests.post(submit_url, params=params,
+                                  files={(parsed_url.path.rsplit('/')[-1], f)})            
+        else:            
+            params['videoUrl'] = video_url
+            print(submit_url, params)
+            r = requests.post(submit_url, params=params)
+
         r.raise_for_status()
         job = JobStatus(**r.json())
-        #print("Submission response:", job)
         return job.id
     
 
-    def jobs(self) -> dict[str, JobStatus]:
+    def _jobs(self) -> dict[str, JobStatus]:
         "Get information about the jobs in AVI"
         res = {}
         nextpage = {}
         while True:
             check_url = f"{self.api_url_base}/Videos"
             r = requests.get(check_url,
-                            params={'accessToken': self.get_access_token(),
+                            params={'accessToken': self._get_access_token(),
                                     **nextpage})
             r.raise_for_status()
             data = r.json()
@@ -135,42 +148,69 @@ class AzureVideoIndexer:
         return res
 
 
-    def job_info(self, job_id) -> JobStatus:
+    def get_status(self, job_id) -> AsyncJobStatus:
         """Get information about a specific job"""
-        j = self.jobs()
+        j = self._jobs()
         if job_id in j:
-            return j[job_id]
+            job = j[job_id]            
+            state_map = {JobState.UPLOADED: (AsyncStatusCode.IN_PROGRESS, 0),
+                         JobState.PROCESSING: (AsyncStatusCode.IN_PROGRESS, float(job.processingProgress.replace('%', ''))),
+                         JobState.PROCESSED: (AsyncStatusCode.FINISHED, 100),
+                         JobState.FAILED: (AsyncStatusCode.ERROR, 100)}
+            return AsyncJobStatus(job_id=job_id,
+                                  status=state_map[job.state][0],
+                                  progress=state_map[job.state][1])
         else:
-            return None
+            raise KeyError(f"Job id {job_id} doesn't exist")
   
 
-    def check(self, job_id) -> dict | None:
+    def is_done(self, job_id: str) -> bool:
+        return job_id in self._jobs()
+
+
+    def get_result(self, job_id: str) -> ToolOutput | None:
         "Check on the status and handle results if ready"
-        # get the job data.
-        job = self.job_info(job_id)        
-        if job.state in ('Uploaded', 'Processing'):
+        
+        job = self.get_status(job_id)        
+        if job.progress < 100:
+            # not done yet.
             return None
         
-        # write the Azure Video Index data to a file
-        r = requests.get(url=f"{self.api_url_base}/Videos/{job.id}/Index",
+        # get the video indexer information
+        r = requests.get(url=f"{self.api_url_base}/Videos/{job.job_id}/Index",
                          params={
-                            'accessToken': self.get_access_token(),
+                            'accessToken': self._get_access_token(),
                             'language': 'English',
                             'includeSummarizedInsights': 'true',
                         })       
         r.raise_for_status()
-        res = {'data': r.json()}
+        res = {'data': r.json(),
+               'thumbnails': {}}
         # look for other artifacts
         for artifact in ('ocr', 'faces'):
             r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
                              params={'type': artifact,
-                                     'accessToken': self.get_access_token()})            
+                                     'accessToken': self._get_access_token()})            
             if r.status_code == 200:
                 artifact_url = r.text.strip('"')
                 
                 print(f"Found {artifact} artifact at {artifact_url}")
                 r = requests.get(url=artifact_url)
-                res[artifact] = r.content
+                print(f"Artifact mime-type: {r.headers['Content-Type']}")
+                try:
+                    res[artifact] = json.loads(r.content)
+                except:
+                    res[artifact] = r.content
+        # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
+        # find all the thumbnails
+        thumb_base = f"{self.api_url_base}/Videos/{job_id}/Thumbnails"
+        for thumbId in set(key_finder(res['data'], 'thumbnailId')):
+            r = requests.get(url=f"{thumb_base}/{thumbId}", 
+                             params={'accessToken': self._get_access_token()})            
+            if r.status_code == 200:
+                res['thumbnails'][thumbId] = r.content
+            else:
+                logging.warning(f"Cannot retrieve thumbnail {thumbId}")
 
         return res
 
@@ -182,13 +222,35 @@ class AzureVideoIndexer:
         return r
 
 
-    def cleanup(self, job_id):
+    def cleanup(self, job_id: str):
         """Delete an AVI job"""        
         logging.info(f"Removing Video Indexer Job {job_id}")
         video_url = f"{self.api_url_base}/Videos/{job_id}"
         requests.delete(url=video_url,
-                        params={'accessToken': self.get_access_token()})
+                        params={'accessToken': self._get_access_token()})
         
+
+
+def key_finder(data: Any, key: str) -> list:
+    """Find the values for the given key no matter where
+       it is in the data structure"""
+    res = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k == key:
+                res.append(v)
+            else:
+                if isinstance(v, dict):
+                    res.extend(key_finder(v, key))
+                elif isinstance(v, (list, set, tuple)):
+                    for i in v:
+                        res.extend(key_finder(i, key))
+    elif isinstance(data, (set, list, tuple)):
+        for i in data:
+            res.extend(key_finder(i, key))
+
+    return res
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -200,14 +262,37 @@ def main():
     parser.add_argument('--azure_tenant_id', type=str, help='Azure Tenant ID (default: environment or az login)')
     parser.add_argument('--azure_client_secret', type=str, help='Azure Client Secret (default: environment or az login)')
     
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--video_url", type=str, help="Video to submit for processing")
-    group.add_argument("--list", action="store_true", help="List the VI jobs")
-    group.add_argument("--delete", type=str, help="Delete a VI job")
-    group.add_argument("--delete_all", action="store_true", help="Delete all VI jobs")
+    subp = parser.add_subparsers(dest="command", help="Sub-commands", required=True)
+    cmd = subp.add_parser("list", help="List Video Indexer jobs")
+    cmd.add_argument("--format", choices=['yaml', 'json'], default='yaml', help="Output format")
+
+    cmd = subp.add_parser("delete", help="Delete Video Indexer job")
+    cmd.add_argument("job_id", help="Job ID to delete")
+
+    cmd = subp.add_parser("delete_all", help="Delete all Video Indexer Jobs")
+
+    cmd = subp.add_parser("submit", help="Submit a new Video Indexer Job")
+    cmd.add_argument("video_url", help="Video URL")
+
+    cmd = subp.add_parser("run", help="Run a new Video Indexer Job and wait for the results")
+    cmd.add_argument("video_url", help="Video URL")
+    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format if waiting")
+
+    cmd = subp.add_parser("status", help="Retrive a Video Indexer Job Status")
+    cmd.add_argument("job_id", help="Job Id to retrieve")
+    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format")
+
+    cmd = subp.add_parser("retrieve", help="Retrive a Video Indexer Job Result")
+    cmd.add_argument("job_id", help="Job Id to retrieve")
+    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format")
+
+    cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects")
+    cmd.add_argument("rawfile", help="Raw file data")
+
     args = parser.parse_args()
 
     logging.basicConfig(format=LOG_FORMAT, level=logging.DEBUG if args.debug else logging.INFO)
+    logging.getLogger('azure').setLevel(logging.INFO if args.debug else logging.WARNING)
 
     # copy any environment settings to our variables.  This sort of duplicates
     # what happens in the environment credential chain for azure, but it's a
@@ -221,33 +306,61 @@ def main():
                            args.vi_account_name, args.azure_tenant_id,
                            args.azure_client_id, args.azure_client_secret)
 
-    if args.list:
-        for k, v in vi.jobs().items():
-            print(k, v)
-    elif args.delete:
-        vi.cleanup(args.delete)
-    elif args.delete_all:
-        for k, v in vi.jobs().items():
-            vi.cleanup(k)
-    elif args.video_url:
-        job_id = vi.submit(args.video_url, 
-                        metadata={'title': 'Nothing to see here',
-                                    'director': 'Alan Smithee'},
-                        externalId="some external id",
-                        description="A test from here")        
-        logging.info(f"Submitted job: {job_id}")
-        while (result := vi.check(job_id)) is None:
-            js = vi.job_info(job_id)
-            logging.info(f"Status: {js.processingProgress}, {js.state}")
-            time.sleep(10)
+    match args.command:
+        case "list":
+            out = {}
+            for k, v in vi._jobs().items():
+                out[k] = v.model_dump()
+            if args.format == "yaml":
+                print(yaml.safe_dump(out))
+            else:
+                print(json.dumps(out))
 
-        result = vi.wait_until_done(job_id)
-
-        print(yaml.safe_dump(result))
+        case "delete":
+            vi.cleanup(args.job_id)
         
-        vi.cleanup(job_id)
-    else:
-        logging.error("How did we get here?")
+        case "delete_all":
+            for k in vi._jobs().keys():
+                vi.cleanup(k)
+
+        case "submit":
+            job_id = vi.submit(args.video_url)        
+            print(job_id)
+
+        case "run":
+            result = vi.run(args.video_url)
+
+            if args.format == "yaml":
+                print(yaml.safe_dump(result))
+            else:
+                print(json.dumps(result))
+                        
+        case "status":
+            result = vi.get_status(args.job_id)
+            if args.format == "yaml":
+                print(yaml.safe_dump(result.model_dump()))
+            else:
+                print(json.dumps(result.model_dump()))            
+
+        case "retrieve":
+            result = vi.get_result(args.job_id)
+            if result is None:
+                logging.info("The job is not ready yet")
+            else:
+                if args.format == "yaml":
+                    print(yaml.safe_dump(result))
+                else:
+                    print(json.dumps(result))            
+
+        case "parseraw":
+            AmpAVBaseModel.model_config = ConfigDict(extra="forbid")
+            with open(args.rawfile) as f:
+                data = yaml.safe_load(f)
+            
+            print(key_finder(data, 'thumbnailId'))
+            vidata = RawVideoIndexer(**data)
+            print(vidata.model_dump_yaml())
+
 
 if __name__ == "__main__":
     main()

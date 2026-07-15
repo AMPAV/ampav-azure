@@ -4,15 +4,18 @@ from typing import Any
 from pydantic import ConfigDict
 
 from ampav.core.logging import LOG_FORMAT
-from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode
+from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode, ToolError
 import argparse
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
 import logging
 import os
 import requests
 import time
-
+from ampav.core.schema.transcript import Transcript
+from ampav.core.utils import hhmmss2seconds
 from ampav.core.schema.basemodel import AmpAVBaseModel
+from ampav.core.schema.compound import CompoundOutput
+from ampav.core.schema.segments import ParagraphSegment, WordSegment
 from ampav.core.schema.tool import ToolOutput
 from .vi_models import JobStatus, RawVideoIndexer, JobState
 from urllib.parse import urlparse
@@ -54,7 +57,6 @@ class AzureVideoIndexer(AsyncTool):
 
             self._get_access_token()
 
-            
             
     def _get_access_token(self):
         """Get the authentication token, regenerating it if needed"""
@@ -108,9 +110,9 @@ class AzureVideoIndexer(AsyncTool):
         # if videoUrl is not specified, the file can be sent as multipart/form body
         # fileName
 
-        params = {'name': video_url.rsplit('/', 1)[-1],
-                  'accessToken': self._get_access_token(),
-                  **kwargs}
+        params = kwargs
+        params.update({'name': video_url.rsplit('/', 1)[-1],
+                       'accessToken': self._get_access_token()})    
                             
         parsed_url = urlparse(video_url)
         if not parsed_url.scheme or not parsed_url.netloc:
@@ -148,34 +150,61 @@ class AzureVideoIndexer(AsyncTool):
         return res
 
 
-    def get_status(self, job_id) -> AsyncJobStatus:
-        """Get information about a specific job"""
-        j = self._jobs()
-        if job_id in j:
-            job = j[job_id]            
-            state_map = {JobState.UPLOADED: (AsyncStatusCode.IN_PROGRESS, 0),
-                         JobState.PROCESSING: (AsyncStatusCode.IN_PROGRESS, float(job.processingProgress.replace('%', ''))),
-                         JobState.PROCESSED: (AsyncStatusCode.FINISHED, 100),
-                         JobState.FAILED: (AsyncStatusCode.ERROR, 100)}
-            return AsyncJobStatus(job_id=job_id,
-                                  status=state_map[job.state][0],
-                                  progress=state_map[job.state][1])
-        else:
-            raise KeyError(f"Job id {job_id} doesn't exist")
-  
-
-    def is_done(self, job_id: str) -> bool:
-        return job_id in self._jobs()
-
-
-    def get_result(self, job_id: str) -> ToolOutput | None:
-        "Check on the status and handle results if ready"
+    def list_jobs(self) -> list[AsyncJobStatus]:
+        """Return a list of job status info for all jobs known by the implementation
         
+        Note: The implementation should restrict the returned jobs to ones that the
+        library tool has created, but this is not guaranteed.
+        """
+        res: list[AsyncJobStatus] = []
+        for k, v in self._jobs().items():
+            res.append(AsyncJobStatus(job_id=k,
+                                      status={JobState.UPLOADED: AsyncStatusCode.QUEUED,
+                                              JobState.PROCESSING: AsyncStatusCode.IN_PROGRESS,
+                                              JobState.PROCESSED: AsyncStatusCode.SUCCEEDED,
+                                              JobState.FAILED: AsyncStatusCode.FAILED}[v.status],
+                                      progress=float(v.processingProgress.replace('%', '')),
+                                      message=None))
+        return res
+
+
+    def get_status(self, job_id: str, details: bool = True) -> AsyncJobStatus:  
+        """ Return progress/status information for a job.
+
+        Implementors may include additional provider-specific details when 
+        `details` is true.
+
+        If the job doesn't exist, a KeyError will be raised
+
+        Note:  The default value of `details` may vary from tool to tool.
+        """
+
+        for j in self.list_jobs():
+            if j.job_id == job_id:
+                return j
+        return KeyError(f"Job id {job_id} doesn't exist")
+    
+    
+    def get_result(self, job_id: str) -> ToolOutput | None:
+        """Return AMPAV tool output when ready, otherwise return None.
+
+        When the result has been successfully retrieved the job will be
+        cleaned up.
+
+        If the job doesn't exist, a KeyError will be raised.
+
+        Failed jobs will be cleaned up and raise a ToolError with relevant details.
+        """        
         job = self.get_status(job_id)        
-        if job.progress < 100:
+        if job.status in (AsyncStatusCode.QUEUED, AsyncStatusCode.IN_PROGRESS):
             # not done yet.
             return None
         
+        if job.status == AsyncStatusCode.FAILED:
+            self.cleanup(job_id)
+            raise ToolError("The job has failed")
+        
+
         # get the video indexer information
         r = requests.get(url=f"{self.api_url_base}/Videos/{job.job_id}/Index",
                          params={
@@ -184,7 +213,8 @@ class AzureVideoIndexer(AsyncTool):
                             'includeSummarizedInsights': 'true',
                         })       
         r.raise_for_status()
-        res = {'data': r.json(),
+        res = {'format': 'viraw',
+               'data': r.json(),
                'thumbnails': {}}
         # look for other artifacts
         for artifact in ('ocr', 'faces'):
@@ -214,20 +244,105 @@ class AzureVideoIndexer(AsyncTool):
 
         return res
 
+    @staticmethod
+    def native_to_tool_output(native: dict) -> ToolOutput:
+        """Convert a native result data structure (such as raw AWS Transcribe
+        data) into an AMPAV ToolOutput."""
 
-    def wait_until_done(self, job_id, check_interval=30):
-        """Poll the cloud job until the job finishes"""
-        while (r := self.check(job_id)) is None:
-            time.sleep(check_interval)
-        return r
+        tool_output = ToolOutput(tool_name="Azure Video Indexer",
+                                 tool_version="1.0",
+                                 output=CompoundOutput())
 
 
-    def cleanup(self, job_id: str):
-        """Delete an AVI job"""        
+        # if the data looks like it's a viraw that we're generating internally
+        # we'll use that, otherwise we'll make the raw data (which probably came
+        # directly from AVI) look like what we're generating.
+        if native.get('format', None) != 'viraw':
+            native = {'data': native,
+                      'thumbnails': {}}
+        
+        # Load the speaker names.
+        video = native['data']['video'][0]
+        speakers = {}
+        for speaker in video['insights']['speakers']:
+            speakers[speaker['id']] = speaker['name']
+        
+        # Let's get the transcript first.  AVI gives us the audio in paragraph
+        # style chunks. We'll populate that and then create the rest of the
+        # transcript types from that.        
+        transcript = Transcript(media_duration=hhmmss2seconds(video['insights']['duration']),
+                                languages=video['insights']['languages'])
+                
+        for para in video['insights']['transcript']:
+            # I don't know if AVI ever returns more than one instace per
+            # paragraph, but just to be sure, I'm going to iterate. Also,
+            # I'm using adjusted{Start,End} because that's guaranteed to be
+            # relative to the start of the video.
+            for para_instance in para['instances']:
+                p = ParagraphSegment(start_time=hhmmss2seconds(para_instance['adjustedStart']),
+                                                   end_time=hhmmss2seconds(para_instance['adjustedEnd']),
+                                                   text=para['text'],
+                                                   language=para['language'],
+                                                   speaker=speakers.get(para['speakerId'], "Unknown Speaker"))
+                transcript.paragraphs.append(p)
+
+        # It's really weird the way that AVI returns the paragraphs, so just
+        # to make sure there's not some goofy "They said 'Thank you' 42 times
+        # so we'll bundle it into a single entry", I'm going to sort the 
+        # paragraphs by start time and that should do the trick.
+        transcript.paragraphs = sorted(transcript.paragraphs, key=lambda x: x.start_time) 
+
+        # Paragraphs -> text is pretty easy.
+        transcript.text = " ".join([x.text for x in p])
+
+        # Words is harder...because we have to respect the speaker. Also note
+        # that we don't get word-level timestamps.  I'm going to synthesize them
+        # by chopping them into evenly-spaced chunks.  It's obviously not going
+        # to be right, but it's something that's close.
+        for para in transcript.paragraphs:
+            words = para.text.split()
+            duration = para.duration() / len(words)
+            offset = 0
+            for word in words:
+                transcript.words.append(WordSegment.from_str(word, 
+                                                             start_time=offset, 
+                                                             end_time=offset + duration,
+                                                             speaker=para.speaker,
+                                                             language=para.language))
+                
+        tool_output.output.outputs['transcript'] = transcript
+
+        
+
+
+
+
+    
+        return tool_output
+
+
+    def cleanup(self, job_id: str) -> None:
+        """Clean up temporary resources created by this job.
+        
+        * If the job_id doesn't exist, do nothing
+        * If the job is queued, dequeue it and clean up
+        * If the job is running, stop the job and clean up
+        * If the job has finished, clean up resources.
+
+        This call is blocking and will wait until finished.  If a native job
+        appears to be hung this method may raise an exception.
+        """
+        try:
+            status = self.get_status(job_id)
+        except KeyError:
+            return
+
         logging.info(f"Removing Video Indexer Job {job_id}")
         video_url = f"{self.api_url_base}/Videos/{job_id}"
         requests.delete(url=video_url,
                         params={'accessToken': self._get_access_token()})
+
+
         
 
 

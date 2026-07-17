@@ -2,9 +2,10 @@
 import io
 from typing import Any
 from ampav.core.schema.audio import AudioEffectType, AudioEffects, AudioEffectSegment
+from ampav.core.schema.named_entity import NamedEntities, NamedEntity, NamedEntityType
 from ampav.core.schema.object import DetectedObject, DetectedObjects
 from ampav.core.schema.transcript import Transcript
-from ampav.core.schema.video import VideoPattern, VideoPatternType, VideoPatterns
+from ampav.core.schema.video import KeyFrame, VideoOcr, VideoOcrResult, VideoPattern, VideoPatternType, VideoPatterns, VideoSegment, VideoSegmentType, VideoSegments
 from ampav.core.utils import hhmmss2seconds
 from ampav.core.schema.compound import CompoundOutput
 from ampav.core.schema.segments import ParagraphSegment, WordSegment
@@ -21,23 +22,23 @@ def parse_vi_data(native: dict):
     # we'll use that, otherwise we'll make the raw data (which probably came
     # directly from AVI) look like what we're generating.
     if native.get('format', None) != 'viraw' and 'data' not in native.keys():
-        print("Wrapping!")
         native = {'data': native,
-                    'thumbnails': {}}
-    print(list(native['data'].keys()))
+                  'thumbnails': {}}
+
     # Load the speaker names.    
     video = native['data']['videos'][0]
+    insights = video['insights']
     speakers = {}
-    for speaker in video['insights']['speakers']:
+    for speaker in insights['speakers']:
         speakers[speaker['id']] = speaker['name']
     
     # Let's get the transcript first.  AVI gives us the audio in paragraph
     # style chunks. We'll populate that and then create the rest of the
     # transcript types from that.        
-    transcript = Transcript(media_duration=hhmmss2seconds(video['insights']['duration']),
-                            languages=video['insights']['languages'])
+    transcript = Transcript(media_duration=hhmmss2seconds(insights['duration']),
+                            languages=insights['languages'])
             
-    for para in video['insights']['transcript']:
+    for para in insights['transcript']:
         # I don't know if AVI ever returns more than one instace per
         # paragraph, but just to be sure, I'm going to iterate. Also,
         # I'm using adjusted{Start,End} because that's guaranteed to be
@@ -83,7 +84,7 @@ def parse_vi_data(native: dict):
               'Speech': AudioEffectType.SPEECH,
               'Music Playing': AudioEffectType.MUSIC}
     audio_effects = AudioEffects(media_duration=transcript.media_duration)    
-    for audio_effect in video['insights']['audioEffects']:
+    for audio_effect in insights['audioEffects']:
         for ae_inst in audio_effect['instances']:
             audio_effects.effects.append(AudioEffectSegment(start_time=hhmmss2seconds(ae_inst['adjustedStart']),
                                                             end_time=hhmmss2seconds(ae_inst['adjustedEnd']),
@@ -92,8 +93,25 @@ def parse_vi_data(native: dict):
                                                             label=audio_effect['type'].lower()))
     tool_output.output.outputs['audio_effects'] = audio_effects
 
-    # TODO: brands?
-    
+    # brands
+    named_entities = NamedEntities()
+    for brand in insights['brands']:
+        for inst in brand['instances']:
+            binst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                confidence=brand['confidence'],
+                                tool_private={'description': brand['description'],
+                                              'instanceSource': inst['instanceSource'],
+                                              'referenceId': brand['referenceId'],
+                                              'referenceType': brand['referenceType'],
+                                              'referenceUrl': brand['referenceUrl']},
+                                text=brand['name'],
+                                entity_type="Brand",
+                                type=NamedEntityType.BRAND)
+            named_entities.spans.append(binst)
+
+    tool_output.output.outputs['named_entities'] = named_entities
+
     # Setting up the thumbnail cache here.  If done correctly then we should
     # have efficient image representation in both YAML and internally because
     # we'll only be generating a new image object for each thumbnail and reusing
@@ -117,8 +135,8 @@ def parse_vi_data(native: dict):
     thumbnail_cache = ThumbnailCache(native['thumbnails'])
 
     # detectedObjects
-    detected = DetectedObjects(media_duration=hhmmss2seconds(video['insights']['duration']))
-    for obj in video['insights']['detectedObjects']:
+    detected = DetectedObjects(media_duration=hhmmss2seconds(insights['duration']))
+    for obj in insights['detectedObjects']:
         for inst in obj['instances']:
             detobj = DetectedObject(start_time=hhmmss2seconds(inst['adjustedStart']),
                                     end_time=hhmmss2seconds(inst['adjustedEnd']),
@@ -132,11 +150,11 @@ def parse_vi_data(native: dict):
     tool_output.output.outputs['detected_objects'] = detected
 
     # framePatterns
-    videopats = VideoPatterns(media_duration=hhmmss2seconds(video['insights']['duration']))
+    videopats = VideoPatterns(media_duration=hhmmss2seconds(insights['duration']))
     vpmap = {'Black': VideoPatternType.BLACK,
              'ColorBars': VideoPatternType.COLORBARS,
              }
-    for pat in video['insights']['framePatterns']:
+    for pat in insights['framePatterns']:
         for inst in pat['instances']:
             vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
                                 end_time=hhmmss2seconds(inst['adjustedEnd']),
@@ -148,20 +166,61 @@ def parse_vi_data(native: dict):
 
     # keywords
     # labels
+
     # namedLocations
+    for loc in insights['namedLocations']:
+        for inst in loc['instances']:
+            linst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                confidence=loc['confidence'],
+                                tool_private={'description': loc['description'],
+                                              'instanceSource': inst['instanceSource'],
+                                              'referenceId': loc['referenceId'],                                              
+                                              'referenceUrl': loc['referenceUrl']},
+                                text=loc['name'],
+                                entity_type="Location",
+                                type=NamedEntityType.LOCATION)
+            named_entities.spans.append(linst)
+
     # ocr
-    # scenes
-    # shots
+    videoocr = VideoOcr(media_duration=hhmmss2seconds(insights['duration']))
+    for ocr in insights['ocr']:
+        for inst in ocr['instances']:
+            vocr = VideoOcrResult(x1=ocr['left'],
+                                  y1=ocr['top'],
+                                  x2=ocr['left'] + ocr['width'],
+                                  y2=ocr['top'] - ocr['height'],
+                                  angle=ocr['angle'],
+                                  text=ocr['text'],
+                                  language=ocr['language'],
+                                  start_time=hhmmss2seconds(inst['adjustedStart']),
+                                  end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                  confidence=ocr['confidence'])
+            videoocr.ocr.append(vocr)
+    tool_output.output.outputs['video_ocr'] = videoocr
+
+    # scenes & shots
+    vsegs = VideoSegments(media_duration=hhmmss2seconds(insights['duration']))
+    for skey, stype, slabel in (('scenes', VideoSegmentType.SCENE, 'Scene'),
+                               ('shots', VideoSegmentType.SHOT, 'Shot')):
+        for sthing in insights[skey]:
+            keyframes = []
+            for keyframe in sthing.get('keyFrames', []):
+                for kinst in keyframe['instances']:
+                    keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
+                                              frame=thumbnail_cache.get(kinst['thumbnailId'])))
+            for inst in sthing['instances']:
+                sinst = VideoSegment(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                     end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                     type=stype,
+                                     label=slabel,
+                                     keyframes=keyframes)
+                vsegs.segments.append(sinst)
+    tool_output.output.outputs['video_segments'] = vsegs
+
     # topics
 
-
-
     return tool_output
-
-
-
-        
-
 
 def key_finder(data: Any, key: str) -> list:
     """Find the values for the given key no matter where

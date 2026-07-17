@@ -11,6 +11,7 @@ from ampav.core.schema.compound import CompoundOutput
 from ampav.core.schema.segments import ParagraphSegment, WordSegment
 from ampav.core.schema.tool import ToolOutput
 from ampav.core.schema.image import Image
+import PIL.Image
 
 def parse_vi_data(native: dict):
     tool_output = ToolOutput(tool_name="Azure Video Indexer",
@@ -150,19 +151,20 @@ def parse_vi_data(native: dict):
     tool_output.output.outputs['detected_objects'] = detected
 
     # framePatterns
-    videopats = VideoPatterns(media_duration=hhmmss2seconds(insights['duration']))
-    vpmap = {'Black': VideoPatternType.BLACK,
-             'ColorBars': VideoPatternType.COLORBARS,
-             }
-    for pat in insights['framePatterns']:
-        for inst in pat['instances']:
-            vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                confidence=pat['confidence'],
-                                label=pat['patternType'],
-                                type=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
-            videopats.patterns.append(vpat)
-    tool_output.output.outputs['video_patterns'] = videopats
+    if 'framePatterns' in insights:
+        videopats = VideoPatterns(media_duration=hhmmss2seconds(insights['duration']))
+        vpmap = {'Black': VideoPatternType.BLACK,
+                'ColorBars': VideoPatternType.COLORBARS,
+                }
+        for pat in insights['framePatterns']:
+            for inst in pat['instances']:
+                vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                    confidence=pat['confidence'],
+                                    label=pat['patternType'],
+                                    type=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
+                videopats.patterns.append(vpat)
+        tool_output.output.outputs['video_patterns'] = videopats
 
     # keywords
     # labels

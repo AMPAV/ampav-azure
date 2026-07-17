@@ -156,7 +156,7 @@ class AzureVideoIndexer(AsyncTool):
                                       status={JobState.UPLOADED: AsyncStatusCode.QUEUED,
                                               JobState.PROCESSING: AsyncStatusCode.IN_PROGRESS,
                                               JobState.PROCESSED: AsyncStatusCode.SUCCEEDED,
-                                              JobState.FAILED: AsyncStatusCode.FAILED}[v.status],
+                                              JobState.FAILED: AsyncStatusCode.FAILED}[v.state],
                                       progress=float(v.processingProgress.replace('%', '')),
                                       message=None))
         return res
@@ -218,9 +218,9 @@ class AzureVideoIndexer(AsyncTool):
             if r.status_code == 200:
                 artifact_url = r.text.strip('"')
                 
-                print(f"Found {artifact} artifact at {artifact_url}")
+                #print(f"Found {artifact} artifact at {artifact_url}")
                 r = requests.get(url=artifact_url)
-                print(f"Artifact mime-type: {r.headers['Content-Type']}")
+                #print(f"Artifact mime-type: {r.headers['Content-Type']}")
                 try:
                     res[artifact] = json.loads(r.content)
                 except:
@@ -236,7 +236,7 @@ class AzureVideoIndexer(AsyncTool):
             else:
                 logging.warning(f"Cannot retrieve thumbnail {thumbId}")
 
-        return res
+        return AzureVideoIndexer.native_to_tool_output(res)
 
     @staticmethod
     def native_to_tool_output(native: dict) -> ToolOutput:
@@ -297,7 +297,7 @@ def main():
     cmd = subp.add_parser("submit", help="Submit a new Video Indexer Job")
     cmd.add_argument("video_url", help="Video URL")
 
-    cmd = subp.add_parser("run", help="Run a new Video Indexer Job and wait for the results")
+    cmd = subp.add_parser("process", help="Run a new Video Indexer Job and wait for the results")
     cmd.add_argument("video_url", help="Video URL")
     cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format if waiting")
 
@@ -311,6 +311,7 @@ def main():
 
     cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects")
     cmd.add_argument("rawfile", help="Raw file data")
+    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format")
 
     args = parser.parse_args()
 
@@ -350,20 +351,19 @@ def main():
             job_id = vi.submit(args.video_url)        
             print(job_id)
 
-        case "run":
-            result = vi.run(args.video_url)
-
+        case "process":
+            result = vi.process(args.video_url)
             if args.format == "yaml":
-                print(yaml.safe_dump(result))
+                print(result.model_dump_yaml())
             else:
-                print(json.dumps(result))
+                print(result.model_dump_json())
                         
         case "status":
             result = vi.get_status(args.job_id)
             if args.format == "yaml":
-                print(yaml.safe_dump(result.model_dump()))
+                print(result.model_dump_yaml())
             else:
-                print(json.dumps(result.model_dump()))            
+                print(result.model_dump_json())
 
         case "retrieve":
             result = vi.get_result(args.job_id)
@@ -371,19 +371,19 @@ def main():
                 logging.info("The job is not ready yet")
             else:
                 if args.format == "yaml":
-                    print(yaml.safe_dump(result))
+                    print(result.model_dump_yaml())
                 else:
-                    print(json.dumps(result))            
+                    print(result.model_dump_json())            
 
-        case "parseraw":
-            AmpAVBaseModel.model_config = ConfigDict(extra="forbid")
+        case "parseraw":            
             with open(args.rawfile) as f:
                 data = yaml.safe_load(f)
-            
-            print(key_finder(data, 'thumbnailId'))
-            vidata = RawVideoIndexer(**data)
-            print(vidata.model_dump_yaml())
-
+            vidata = AzureVideoIndexer.native_to_tool_output(data)
+            if args.format == "yaml":
+                print(vidata.model_dump_yaml())
+            else:
+                print(vidata.model_dump_json())
+                
 
 if __name__ == "__main__":
     main()

@@ -88,8 +88,8 @@ def parse_vi_data(native: dict):
             audio_effects.effects.append(AudioEffectSegment(start_time=hhmmss2seconds(ae_inst['adjustedStart']),
                                                             end_time=hhmmss2seconds(ae_inst['adjustedEnd']),
                                                             confidence=ae_inst['confidence'],
-                                                            effect=ae_map.get(audio_effect['type'], AudioEffectType.UNKNOWN),
-                                                            name=audio_effect['type'].lower()))
+                                                            type=ae_map.get(audio_effect['type'], AudioEffectType.UNKNOWN),
+                                                            label=audio_effect['type'].lower()))
     tool_output.output.outputs['audio_effects'] = audio_effects
 
     # TODO: brands?
@@ -124,9 +124,10 @@ def parse_vi_data(native: dict):
                                     end_time=hhmmss2seconds(inst['adjustedEnd']),
                                     confidence=inst['confidence'],                                    
                                     image=thumbnail_cache.get(obj['thumbnailId']),
-                                    name=obj['displayName'],                                    
-                                    type=obj['type'],
-                                    wikidata_id=obj['wikiDataId'])
+                                    text=obj['displayName'],                                    
+                                    label=obj['type'],
+                                    tool_private={'wikidata_id': obj['wikiDataId']})
+                                    
             detected.objects.append(detobj)
     tool_output.output.outputs['detected_objects'] = detected
 
@@ -140,8 +141,8 @@ def parse_vi_data(native: dict):
             vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
                                 end_time=hhmmss2seconds(inst['adjustedEnd']),
                                 confidence=pat['confidence'],
-                                name=pat['patternType'],
-                                pattern=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
+                                label=pat['patternType'],
+                                type=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
             videopats.patterns.append(vpat)
     tool_output.output.outputs['video_patterns'] = videopats
 

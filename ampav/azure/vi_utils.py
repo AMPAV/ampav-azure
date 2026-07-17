@@ -4,6 +4,7 @@ from typing import Any
 from ampav.core.schema.audio import AudioEffectType, AudioEffects, AudioEffectSegment
 from ampav.core.schema.object import DetectedObject, DetectedObjects
 from ampav.core.schema.transcript import Transcript
+from ampav.core.schema.video import VideoPattern, VideoPatternType, VideoPatterns
 from ampav.core.utils import hhmmss2seconds
 from ampav.core.schema.compound import CompoundOutput
 from ampav.core.schema.segments import ParagraphSegment, WordSegment
@@ -91,7 +92,7 @@ def parse_vi_data(native: dict):
                                                             name=audio_effect['type'].lower()))
     tool_output.output.outputs['audio_effects'] = audio_effects
 
-    # brands?
+    # TODO: brands?
     
     # Setting up the thumbnail cache here.  If done correctly then we should
     # have efficient image representation in both YAML and internally because
@@ -130,6 +131,20 @@ def parse_vi_data(native: dict):
     tool_output.output.outputs['detected_objects'] = detected
 
     # framePatterns
+    videopats = VideoPatterns(media_duration=hhmmss2seconds(video['insights']['duration']))
+    vpmap = {'Black': VideoPatternType.BLACK,
+             'ColorBars': VideoPatternType.COLORBARS,
+             }
+    for pat in video['insights']['framePatterns']:
+        for inst in pat['instances']:
+            vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                confidence=pat['confidence'],
+                                name=pat['patternType'],
+                                pattern=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
+            videopats.patterns.append(vpat)
+    tool_output.output.outputs['video_patterns'] = videopats
+
     # keywords
     # labels
     # namedLocations
@@ -175,8 +190,4 @@ if __name__ == "__main__":
         data = yaml.safe_load(f)
     
     t = parse_vi_data(data)
-
-    x: PIL.Image.Image = t.output.outputs['thumbnail'].get_image()
-    x.show("Thumbnail")
-    print(x.width, x.height)
     print(t.model_dump_yaml())

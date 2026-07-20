@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime
 from ampav.core.schema.basemodel import AmpAVBaseModel
 from enum import StrEnum
@@ -26,6 +26,10 @@ class JobStatus(AmpAVBaseModel):
     sourceLanguages: list[str]
 
 
-
-
-
+class ViRawData(AmpAVBaseModel):
+    """This is a really thin wrapper over a full VI data dump"""
+    format: Literal['viraw'] = 'viraw'
+    data: dict
+    thumbnails: dict = Field(default_factory=dict)
+    ocr: dict = Field(default_factory=dict)
+    faces: dict = Field(default_factory=dict)

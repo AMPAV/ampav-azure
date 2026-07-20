@@ -113,10 +113,7 @@ def parse_vi_data(native: dict):
 
     tool_output.output.outputs['named_entities'] = named_entities
 
-    # Setting up the thumbnail cache here.  If done correctly then we should
-    # have efficient image representation in both YAML and internally because
-    # we'll only be generating a new image object for each thumbnail and reusing
-    # it all over the place.  Sadly, this doesn't help us for JSON.
+    # Setting up the thumbnail cache here to make image instantiation faster.
     class ThumbnailCache:
         def __init__(self, data_map: dict):
             self.data_map = data_map
@@ -128,8 +125,9 @@ def parse_vi_data(native: dict):
                     self.cache[thumbnail_id] = None
                 else:                    
                     pil_img = PIL.Image.open(io.BytesIO(self.data_map[thumbnail_id]))
-                    img = Image()                    
-                    img.set_image(pil_img, f"{thumbnail_id}.png", "png")
+                    #img = Image()                    
+                    #img.set_image(pil_img, f"{thumbnail_id}.png", "png")
+                    img = Image(filename=f"{thumbnail_id}.png", image=pil_img)
                     self.cache[thumbnail_id] = img
             return self.cache[thumbnail_id]
 
@@ -210,7 +208,7 @@ def parse_vi_data(native: dict):
             for keyframe in sthing.get('keyFrames', []):
                 for kinst in keyframe['instances']:
                     keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
-                                              frame=thumbnail_cache.get(kinst['thumbnailId'])))
+                                     frame=thumbnail_cache.get(kinst['thumbnailId'])))
             for inst in sthing['instances']:
                 sinst = VideoSegment(start_time=hhmmss2seconds(inst['adjustedStart']),
                                      end_time=hhmmss2seconds(inst['adjustedEnd']),
@@ -223,6 +221,7 @@ def parse_vi_data(native: dict):
     # topics
 
     return tool_output
+
 
 def key_finder(data: Any, key: str) -> list:
     """Find the values for the given key no matter where

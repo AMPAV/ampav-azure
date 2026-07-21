@@ -1,6 +1,7 @@
 #!/bin/env python3.12
 import io
 from typing import Any
+from ampav.core.schema.annotation import Annotation, AnnotationType, Annotations
 from ampav.core.schema.audio import AudioEffectType, AudioEffects, AudioEffectSegment
 from ampav.core.schema.named_entity import NamedEntities, NamedEntity, NamedEntityType
 from ampav.core.schema.object import DetectedObject, DetectedObjects
@@ -30,88 +31,93 @@ def parse_vi_data(native: dict):
     video = native['data']['videos'][0]
     insights = video['insights']
     speakers = {}
-    for speaker in insights['speakers']:
-        speakers[speaker['id']] = speaker['name']
+    if 'speakers' in insights:
+        for speaker in insights['speakers']:
+            speakers[speaker['id']] = speaker['name']
     
     # Let's get the transcript first.  AVI gives us the audio in paragraph
     # style chunks. We'll populate that and then create the rest of the
     # transcript types from that.        
-    transcript = Transcript(media_duration=hhmmss2seconds(insights['duration']),
-                            languages=insights['languages'])
-            
-    for para in insights['transcript']:
-        # I don't know if AVI ever returns more than one instace per
-        # paragraph, but just to be sure, I'm going to iterate. Also,
-        # I'm using adjusted{Start,End} because that's guaranteed to be
-        # relative to the start of the video.
-        for para_instance in para['instances']:
-            p = ParagraphSegment(start_time=hhmmss2seconds(para_instance['adjustedStart']),
-                                                end_time=hhmmss2seconds(para_instance['adjustedEnd']),
-                                                text=para['text'],
-                                                language=para['language'],
-                                                speaker=speakers.get(para['speakerId'], "Unknown Speaker"),
-                                                confidence=para['confidence'])
-            transcript.paragraphs.append(p)
+    if 'transcript' in insights:
+        transcript = Transcript(media_duration=hhmmss2seconds(insights['duration']),
+                                languages=insights['languages'])
+                
+        for para in insights['transcript']:
+            # I don't know if AVI ever returns more than one instace per
+            # paragraph, but just to be sure, I'm going to iterate. Also,
+            # I'm using adjusted{Start,End} because that's guaranteed to be
+            # relative to the start of the video.
+            for para_instance in para['instances']:
+                p = ParagraphSegment(start_time=hhmmss2seconds(para_instance['adjustedStart']),
+                                                    end_time=hhmmss2seconds(para_instance['adjustedEnd']),
+                                                    text=para['text'],
+                                                    language=para['language'],
+                                                    speaker=speakers.get(para['speakerId'], "Unknown Speaker"),
+                                                    confidence=para['confidence'])
+                transcript.paragraphs.append(p)
 
-    # It's really weird the way that AVI returns the paragraphs, so just
-    # to make sure there's not some goofy "They said 'Thank you' 42 times
-    # so we'll bundle it into a single entry", I'm going to sort the 
-    # paragraphs by start time and that should do the trick.
-    transcript.paragraphs = sorted(transcript.paragraphs, key=lambda x: x.start_time) 
+        # It's really weird the way that AVI returns the paragraphs, so just
+        # to make sure there's not some goofy "They said 'Thank you' 42 times
+        # so we'll bundle it into a single entry", I'm going to sort the 
+        # paragraphs by start time and that should do the trick.
+        transcript.paragraphs = sorted(transcript.paragraphs, key=lambda x: x.start_time) 
 
-    # Paragraphs -> text is pretty easy.
-    transcript.text = " ".join([x.text for x in transcript.paragraphs])
+        # Paragraphs -> text is pretty easy.
+        transcript.text = " ".join([x.text for x in transcript.paragraphs])
 
-    # Words is harder...because we have to respect the speaker. Also note
-    # that we don't get word-level timestamps.  I'm going to synthesize them
-    # by chopping them into evenly-spaced chunks.  It's obviously not going
-    # to be right, but it's something that's close.
-    for para in transcript.paragraphs:
-        words = para.text.split()
-        duration = para.duration() / len(words)
-        offset = 0
-        for word in words:
-            transcript.words.append(WordSegment.from_str(word, 
-                                                            start_time=offset, 
-                                                            end_time=offset + duration,
-                                                            speaker=para.speaker,
-                                                            language=para.language,
-                                                            confidence=para.confidence))
-            
-    tool_output.output.outputs['transcript'] = transcript
+        # Words is harder...because we have to respect the speaker. Also note
+        # that we don't get word-level timestamps.  I'm going to synthesize them
+        # by chopping them into evenly-spaced chunks.  It's obviously not going
+        # to be right, but it's something that's close.
+        for para in transcript.paragraphs:
+            words = para.text.split()
+            duration = para.duration() / len(words)
+            offset = 0
+            for word in words:
+                transcript.words.append(WordSegment.from_str(word, 
+                                                                start_time=offset, 
+                                                                end_time=offset + duration,
+                                                                speaker=para.speaker,
+                                                                language=para.language,
+                                                                confidence=para.confidence))
+                
+        tool_output.output.outputs['transcript'] = transcript
+    
     # Audio effects
     # should be pretty straightforward
-    ae_map = {'Silence': AudioEffectType.SILENCE,
-              'Speech': AudioEffectType.SPEECH,
-              'Music Playing': AudioEffectType.MUSIC}
-    audio_effects = AudioEffects(media_duration=transcript.media_duration)    
-    for audio_effect in insights['audioEffects']:
-        for ae_inst in audio_effect['instances']:
-            audio_effects.effects.append(AudioEffectSegment(start_time=hhmmss2seconds(ae_inst['adjustedStart']),
-                                                            end_time=hhmmss2seconds(ae_inst['adjustedEnd']),
-                                                            confidence=ae_inst['confidence'],
-                                                            type=ae_map.get(audio_effect['type'], AudioEffectType.UNKNOWN),
-                                                            label=audio_effect['type'].lower()))
-    tool_output.output.outputs['audio_effects'] = audio_effects
+    if 'audioEffects' in insights:
+        ae_map = {'Silence': AudioEffectType.SILENCE,
+                'Speech': AudioEffectType.SPEECH,
+                'Music Playing': AudioEffectType.MUSIC}
+        audio_effects = AudioEffects(media_duration=transcript.media_duration)    
+        for audio_effect in insights['audioEffects']:
+            for ae_inst in audio_effect['instances']:
+                audio_effects.effects.append(AudioEffectSegment(start_time=hhmmss2seconds(ae_inst['adjustedStart']),
+                                                                end_time=hhmmss2seconds(ae_inst['adjustedEnd']),
+                                                                confidence=ae_inst['confidence'],
+                                                                type=ae_map.get(audio_effect['type'], AudioEffectType.UNKNOWN),
+                                                                label=audio_effect['type'].lower()))
+        tool_output.output.outputs['audio_effects'] = audio_effects
 
     # brands
-    named_entities = NamedEntities()
-    for brand in insights['brands']:
-        for inst in brand['instances']:
-            binst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                confidence=brand['confidence'],
-                                tool_private={'description': brand['description'],
-                                              'instanceSource': inst['instanceSource'],
-                                              'referenceId': brand['referenceId'],
-                                              'referenceType': brand['referenceType'],
-                                              'referenceUrl': brand['referenceUrl']},
-                                text=brand['name'],
-                                entity_type="Brand",
-                                type=NamedEntityType.BRAND)
-            named_entities.spans.append(binst)
+    if 'brands' in insights:
+        named_entities = NamedEntities()
+        for brand in insights['brands']:
+            for inst in brand['instances']:
+                binst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                    confidence=brand['confidence'],
+                                    tool_private={'description': brand['description'],
+                                                'instanceSource': inst['instanceSource'],
+                                                'referenceId': brand['referenceId'],
+                                                'referenceType': brand['referenceType'],
+                                                'referenceUrl': brand['referenceUrl']},
+                                    text=brand['name'],
+                                    entity_type="Brand",
+                                    type=NamedEntityType.BRAND)
+                named_entities.spans.append(binst)
 
-    tool_output.output.outputs['named_entities'] = named_entities
+        tool_output.output.outputs['named_entities'] = named_entities
 
     # Setting up the thumbnail cache here to make image instantiation faster.
     class ThumbnailCache:
@@ -125,8 +131,6 @@ def parse_vi_data(native: dict):
                     self.cache[thumbnail_id] = None
                 else:                    
                     pil_img = PIL.Image.open(io.BytesIO(self.data_map[thumbnail_id]))
-                    #img = Image()                    
-                    #img.set_image(pil_img, f"{thumbnail_id}.png", "png")
                     img = Image(filename=f"{thumbnail_id}.png", image=pil_img)
                     self.cache[thumbnail_id] = img
             return self.cache[thumbnail_id]
@@ -134,19 +138,20 @@ def parse_vi_data(native: dict):
     thumbnail_cache = ThumbnailCache(native['thumbnails'])
 
     # detectedObjects
-    detected = DetectedObjects(media_duration=hhmmss2seconds(insights['duration']))
-    for obj in insights['detectedObjects']:
-        for inst in obj['instances']:
-            detobj = DetectedObject(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                    confidence=inst['confidence'],                                    
-                                    image=thumbnail_cache.get(obj['thumbnailId']),
-                                    text=obj['displayName'],                                    
-                                    label=obj['type'],
-                                    tool_private={'wikidata_id': obj['wikiDataId']})
-                                    
-            detected.objects.append(detobj)
-    tool_output.output.outputs['detected_objects'] = detected
+    if 'detectedObjects' in insights:
+        detected = DetectedObjects(media_duration=hhmmss2seconds(insights['duration']))
+        for obj in insights['detectedObjects']:
+            for inst in obj['instances']:
+                detobj = DetectedObject(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                        end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                        confidence=inst['confidence'],                                    
+                                        image=thumbnail_cache.get(obj['thumbnailId']),
+                                        text=obj['displayName'],                                    
+                                        label=obj['type'],
+                                        tool_private={'wikidata_id': obj['wikiDataId']})
+                                        
+                detected.objects.append(detobj)
+        tool_output.output.outputs['detected_objects'] = detected
 
     # framePatterns
     if 'framePatterns' in insights:
@@ -164,61 +169,82 @@ def parse_vi_data(native: dict):
                 videopats.patterns.append(vpat)
         tool_output.output.outputs['video_patterns'] = videopats
 
-    # keywords
-    # labels
-
     # namedLocations
-    for loc in insights['namedLocations']:
-        for inst in loc['instances']:
-            linst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                confidence=loc['confidence'],
-                                tool_private={'description': loc['description'],
-                                              'instanceSource': inst['instanceSource'],
-                                              'referenceId': loc['referenceId'],                                              
-                                              'referenceUrl': loc['referenceUrl']},
-                                text=loc['name'],
-                                entity_type="Location",
-                                type=NamedEntityType.LOCATION)
-            named_entities.spans.append(linst)
+    if 'namedLocations' in insights:
+        for loc in insights['namedLocations']:
+            for inst in loc['instances']:
+                linst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                    confidence=loc['confidence'],
+                                    tool_private={'description': loc['description'],
+                                                'instanceSource': inst['instanceSource'],
+                                                'referenceId': loc['referenceId'],                                              
+                                                'referenceUrl': loc['referenceUrl']},
+                                    text=loc['name'],
+                                    entity_type="Location",
+                                    type=NamedEntityType.LOCATION)
+                named_entities.spans.append(linst)
 
     # ocr
-    videoocr = VideoOcr(media_duration=hhmmss2seconds(insights['duration']))
-    for ocr in insights['ocr']:
-        for inst in ocr['instances']:
-            vocr = VideoOcrResult(x1=ocr['left'],
-                                  y1=ocr['top'],
-                                  x2=ocr['left'] + ocr['width'],
-                                  y2=ocr['top'] - ocr['height'],
-                                  angle=ocr['angle'],
-                                  text=ocr['text'],
-                                  language=ocr['language'],
-                                  start_time=hhmmss2seconds(inst['adjustedStart']),
-                                  end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                  confidence=ocr['confidence'])
-            videoocr.ocr.append(vocr)
-    tool_output.output.outputs['video_ocr'] = videoocr
+    if 'ocr' in insights:
+        videoocr = VideoOcr(media_duration=hhmmss2seconds(insights['duration']))
+        for ocr in insights['ocr']:
+            for inst in ocr['instances']:
+                vocr = VideoOcrResult(x1=ocr['left'],
+                                    y1=ocr['top'],
+                                    x2=ocr['left'] + ocr['width'],
+                                    y2=ocr['top'] - ocr['height'],
+                                    angle=ocr['angle'],
+                                    text=ocr['text'],
+                                    language=ocr['language'],
+                                    start_time=hhmmss2seconds(inst['adjustedStart']),
+                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                    confidence=ocr['confidence'])
+                videoocr.ocr.append(vocr)
+        tool_output.output.outputs['video_ocr'] = videoocr
 
     # scenes & shots
     vsegs = VideoSegments(media_duration=hhmmss2seconds(insights['duration']))
     for skey, stype, slabel in (('scenes', VideoSegmentType.SCENE, 'Scene'),
                                ('shots', VideoSegmentType.SHOT, 'Shot')):
-        for sthing in insights[skey]:
-            keyframes = []
-            for keyframe in sthing.get('keyFrames', []):
-                for kinst in keyframe['instances']:
-                    keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
-                                     frame=thumbnail_cache.get(kinst['thumbnailId'])))
-            for inst in sthing['instances']:
-                sinst = VideoSegment(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                     end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                     type=stype,
-                                     label=slabel,
-                                     keyframes=keyframes)
-                vsegs.segments.append(sinst)
-    tool_output.output.outputs['video_segments'] = vsegs
+        if skey in insights:
+            for sthing in insights[skey]:
+                keyframes = []
+                for keyframe in sthing.get('keyFrames', []):
+                    for kinst in keyframe['instances']:
+                        keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
+                                        frame=thumbnail_cache.get(kinst['thumbnailId'])))
+                for inst in sthing['instances']:
+                    sinst = VideoSegment(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                        end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                        type=stype,
+                                        label=slabel,
+                                        keyframes=keyframes)
+                    vsegs.segments.append(sinst)
+    if vsegs.segments:
+        tool_output.output.outputs['video_segments'] = vsegs
 
-    # topics
+    # keywords, labels, topics
+    anno = Annotations(media_duration=hhmmss2seconds(insights['duration']))
+    for akey, atype, nkey, tkeys, iconf in (('keywords', AnnotationType.KEYWORD, 'text', [], False),
+                                            ('labels', AnnotationType.LABEL, 'name', [], True),
+                                            ('topics', AnnotationType.TOPIC, 'name', ('iabName', 'iptcName', 'referenceId', 'referenceType', 'referenceUrl'), False)):
+        if akey in insights:
+            for athing in insights[akey]:            
+                for ainst in athing['instances']:
+                    a = Annotation(start_time=hhmmss2seconds(ainst['adjustedStart']),
+                                end_time=hhmmss2seconds(ainst['adjustedEnd']),
+                                type=atype,
+                                text=athing[nkey])
+                    a.confidence = ainst['confidence'] if iconf else athing['confidence']
+                    if tkeys:
+                        a.tool_private = dict()
+                        for k in tkeys:
+                            a.tool_private[k] = athing.get(k, None)
+                    anno.annotations.append(a)
+                    
+    if anno.annotations:
+        tool_output.output.outputs['annotations'] = anno
 
     return tool_output
 

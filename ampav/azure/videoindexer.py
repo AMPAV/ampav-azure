@@ -116,7 +116,6 @@ class AzureVideoIndexer(AsyncTool):
                                   files={(parsed_url.path.rsplit('/')[-1], f)})            
         else:            
             params['videoUrl'] = video_url
-            print(submit_url, params)
             r = requests.post(submit_url, params=params)
 
         r.raise_for_status()
@@ -233,6 +232,7 @@ class AzureVideoIndexer(AsyncTool):
             else:
                 logging.warning(f"Cannot retrieve thumbnail {thumbId}")
 
+        self.cleanup(job_id)
         self._rawdata = ViRawData(**res)
         return AzureVideoIndexer.native_to_tool_output(res)
 

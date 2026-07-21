@@ -158,6 +158,7 @@ def parse_vi_data(native: dict):
         videopats = VideoPatterns(media_duration=hhmmss2seconds(insights['duration']))
         vpmap = {'Black': VideoPatternType.BLACK,
                 'ColorBars': VideoPatternType.COLORBARS,
+                'RollingCredits': VideoPatternType.CREDITS,
                 }
         for pat in insights['framePatterns']:
             for inst in pat['instances']:

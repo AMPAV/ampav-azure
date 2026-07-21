@@ -5,6 +5,7 @@ from ampav.core.schema.annotation import Annotation, AnnotationType, Annotations
 from ampav.core.schema.audio import AudioEffectType, AudioEffects, AudioEffectSegment
 from ampav.core.schema.named_entity import NamedEntities, NamedEntity, NamedEntityType
 from ampav.core.schema.object import DetectedObject, DetectedObjects
+from ampav.core.schema.sentiment import Sentiment, SentimentType, Sentiments
 from ampav.core.schema.transcript import Transcript
 from ampav.core.schema.video import KeyFrame, VideoOcr, VideoOcrResult, VideoPattern, VideoPatternType, VideoPatterns, VideoSegment, VideoSegmentType, VideoSegments
 from ampav.core.utils import hhmmss2seconds
@@ -13,6 +14,7 @@ from ampav.core.schema.segments import ParagraphSegment, WordSegment
 from ampav.core.schema.tool import ToolOutput
 from ampav.core.schema.image import Image
 import PIL.Image
+import logging
 
 def parse_vi_data(native: dict):
     tool_output = ToolOutput(tool_name="Azure Video Indexer",
@@ -27,9 +29,24 @@ def parse_vi_data(native: dict):
         native = {'data': native,
                   'thumbnails': {}}
 
-    # Load the speaker names.    
     video = native['data']['videos'][0]
     insights = video['insights']
+
+    # Let's do a quick check to see if there are any fields that I haven't
+    # seen before and warn the user
+    expected_fields = set(['audioEffects', 'blocks', 'brands', 'detectedObjects',
+                           'duration', 'framePatterns', 'keywords', 'labels',
+                           'language', 'languages', 'namedLocations', 'ocr',
+                           'ocrAnalyizedTokenCount', 'ocrMaxTokenCount',
+                           'scenes', 'sentiments', 'schots', 'sourceLanguage',
+                           'sourceLanguages', 'speakers', 'statistics', 
+                           'textualContentModeration', 'topics', 'transcript',
+                           'version'])
+    actual_fields = set(insights.keys())
+    if actual_fields > expected_fields:
+        logging.warning(f"Additional fields in payload: {actual_fields - expected_fields}")
+
+    # Load the speaker names.        
     speakers = {}
     if 'speakers' in insights:
         for speaker in insights['speakers']:
@@ -203,6 +220,23 @@ def parse_vi_data(native: dict):
                                     confidence=ocr['confidence'])
                 videoocr.ocr.append(vocr)
         tool_output.output.outputs['video_ocr'] = videoocr
+
+    # sentiments
+    ssegs = Sentiments(media_duration=hhmmss2seconds(insights['duration']))
+    smap = {'Positive': SentimentType.POSITIVE,
+            'Neutral': SentimentType.NEUTRAL,
+            'Negative': SentimentType.NEGATIVE}
+    if 'sentiments' in insights:
+        for sent in insights['sentiments']:
+            for inst in sent['instances']:
+                sseg = Sentiment(start_time=hhmmss2seconds(inst['adjustedStart']),
+                                 end_time=hhmmss2seconds(inst['adjustedEnd']),
+                                 tool_private={'averageScore': sent['averageScore']},
+                                 type=smap.get(sent['sentimentType'], SentimentType.UNKNOWN),
+                                 label=sent['sentimentType'])
+                ssegs.sentiments.append(sseg)
+        if ssegs.sentiments:
+            tool_output.output.outputs['sentiments'] = ssegs
 
     # scenes & shots
     vsegs = VideoSegments(media_duration=hhmmss2seconds(insights['duration']))

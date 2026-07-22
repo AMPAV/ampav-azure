@@ -216,7 +216,11 @@ class AzureVideoIndexer(AsyncTool):
                'data': r.json(),
                'thumbnails': {}}
         # look for other artifacts
-        for artifact in ('ocr', 'faces'):
+        for artifact in ('Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
+                         'KeyframesThumbnails', 'Emotions', 'TextualContentModeration',
+                         'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
+                         'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
+                         'TextlessMaterial', 'Logos', 'DetectedObjects'):
             r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
                              params={'type': artifact,
                                      'accessToken': self._get_access_token()})            
@@ -225,9 +229,9 @@ class AzureVideoIndexer(AsyncTool):
                 
                 r = requests.get(url=artifact_url)
                 try:
-                    res[artifact] = json.loads(r.content)
+                    res[artifact.lower()] = json.loads(r.content)
                 except:
-                    res[artifact] = r.content
+                    res[artifact.lower()] = r.content
         # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
         # find all the thumbnails
         thumb_base = f"{self.api_url_base}/Videos/{job_id}/Thumbnails"
@@ -239,9 +243,7 @@ class AzureVideoIndexer(AsyncTool):
             else:
                 logging.warning(f"Cannot retrieve thumbnail {thumbId}")
 
-
         return res
-
 
 
     @staticmethod

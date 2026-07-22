@@ -1,8 +1,10 @@
 #!/bin/env python3.12
 import io
 from typing import Any
+
+import yaml
 from ampav.core.schema.annotation import Annotation, AnnotationType, Annotations
-from ampav.core.schema.audio import AudioEffectType, AudioEffects, AudioEffectSegment
+from ampav.core.schema.audio import AudioEffect, AudioEffectType, AudioEffects, AudioEffect
 from ampav.core.schema.named_entity import NamedEntities, NamedEntity, NamedEntityType
 from ampav.core.schema.object import DetectedObject, DetectedObjects
 from ampav.core.schema.sentiment import Sentiment, SentimentType, Sentiments
@@ -10,12 +12,30 @@ from ampav.core.schema.transcript import Transcript
 from ampav.core.schema.video import KeyFrame, VideoOcr, VideoOcrResult, VideoPattern, VideoPatternType, VideoPatterns, VideoSegment, VideoSegmentType, VideoSegments
 from ampav.core.utils import hhmmss2seconds
 from ampav.core.schema.compound import CompoundOutput
-from ampav.core.schema.segments import ParagraphSegment, WordSegment
+from ampav.core.schema.segments import ConfidenceSegment, ParagraphSegment, Segment, WordSegment
 from ampav.core.schema.tool import ToolOutput
-from ampav.core.schema.image import Image
+from ampav.core.schema.image import BoundingBox, Image
 import PIL.Image
 import logging
 
+
+# Setting up the thumbnail cache here to make image instantiation faster.
+class ThumbnailCache:
+    def __init__(self, data_map: dict):
+        self.data_map = data_map
+        self.cache = dict()
+
+    def get(self, thumbnail_id: str):
+        if thumbnail_id not in self.cache:
+            if thumbnail_id not in self.data_map:
+                self.cache[thumbnail_id] = None
+            else:                    
+                pil_img = PIL.Image.open(io.BytesIO(self.data_map[thumbnail_id]))
+                img = Image(filename=f"{thumbnail_id}.png", image=pil_img)
+                self.cache[thumbnail_id] = img
+        return self.cache[thumbnail_id]
+
+    
 def parse_vi_data(native: dict):
     tool_output = ToolOutput(tool_name="Azure Video Indexer",
                                 tool_version="1.0",
@@ -32,20 +52,255 @@ def parse_vi_data(native: dict):
     video = native['data']['videos'][0]
     insights = video['insights']
 
-    # Let's do a quick check to see if there are any fields that I haven't
-    # seen before and warn the user
-    expected_fields = set(['audioEffects', 'blocks', 'brands', 'detectedObjects',
-                           'duration', 'framePatterns', 'keywords', 'labels',
-                           'language', 'languages', 'namedLocations', 'ocr',
-                           'ocrAnalyizedTokenCount', 'ocrMaxTokenCount',
-                           'scenes', 'sentiments', 'schots', 'sourceLanguage',
-                           'sourceLanguages', 'speakers', 'statistics', 
-                           'textualContentModeration', 'topics', 'transcript',
-                           'version'])
-    actual_fields = set(insights.keys())
-    if actual_fields > expected_fields:
-        logging.warning(f"Additional fields in payload: {actual_fields - expected_fields}")
+    functab = {'audioEffects': ['audio_effects', do_audio_effects],
+               'blocks': [None, None],
+               'brands': ['named_entities', do_brands],
+               'detectedObjects': ['detected_objects', do_detected_objects],
+               'duration': [None, None],
+               'emotions': ['annotations', do_annotations],
+               'framePatterns': ['frame_patterns', do_frame_patterns],
+               'keywords': ['annotations', do_annotations],
+               'labels': ['annotations', do_labels],
+               'language': [None, None],
+               'languages': [None, None],
+               'namedLocations': ['named_entities', do_named_locations],
+               'namedPeople': ['named_entities', do_brands],
+               'ocr': ['ocr', do_ocr],
+               'ocrAnalyzedTokenCount': [None, None],
+               'ocrMaxTokenCount': [None, None],
+               'scenes': ['video_segments', do_video_segments],
+               'sentiments': ['sentiments', do_sentiments],
+               'shots': ['video_segments', do_video_segments],
+               'sourceLanguage': [None, None],
+               'sourceLanguages': [None, None],
+               'speakers': [None, None],
+               'statistics': [None, None],
+               'textualContentModeration': [None, None],
+               'topics': ['annotations', do_annotations],
+               'transcript': ['transcript', do_transcript],
+               'version': [None, None]
+               }
 
+    # many things need the duration, so let's compute it here
+    duration = hhmmss2seconds(insights['duration'])
+
+    # access the thumbnail cache
+    thumbnail_cache = ThumbnailCache(native['thumbnails'])
+    
+    # go through the available insights and handle them.
+    for k in insights:
+        if k not in functab:
+            # this is an insight we don't know how to convert, so warn about
+            # it and ignore it.
+            logging.warning(f"Unknown insight '{k}'.  Skipping.")
+            logging.warning(yaml.safe_dump(insights[k]))
+            continue
+
+        dest, handler = functab[k]
+        if dest is None:
+            # we just ignore that one.
+            continue
+
+        count = handler(duration, insights, k, tool_output.output.outputs, dest, thumbnail_cache)
+        if count == 0 or dest not in tool_output.output.outputs:
+            logging.info(f"Expected {dest}, but it wasn't generated by {k}, {count} items generated")
+
+    return tool_output
+
+
+
+def do_annotations(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    """Create annotations"""
+    # Keywords and topics are very nearly the same, so we use the src_key to
+    # handle the differences.
+    differences = {'keywords': [AnnotationType.KEYWORD, 'text', []],
+                   'topics': [AnnotationType.TOPIC, 'name', 
+                              ['iabName', 'iptcName', 'referenceId', 'referenceType', 'referenceUrl']],
+                   'emotions': [AnnotationType.EMOTION, 'type', []]}    
+    annotations = []
+    for item in insights[src_key]:
+        a = Annotation(type=differences[src_key][0],
+                       text=item[differences[src_key][1]],
+                       language=item.get('language', None))
+        for inst in item['instances']:
+            a.instances.append(ConfidenceSegment(**instance2timeseg(inst),
+                                                 confidence=item.get('confidence', None)))        
+        if differences[src_key][2]:
+            a.tool_private = {}
+            for x in differences[src_key][2]:
+                if x in item:
+                    a.tool_private[x] = item[x]
+        annotations.append(a)
+
+    if annotations:
+        if dest_key not in outputs:
+            outputs[dest_key] = Annotations(media_duration=duration)
+        outputs[dest_key].annotations.extend(annotations)
+    return len(annotations)
+
+def do_audio_effects(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    ae_map = {'Silence': AudioEffectType.SILENCE,
+              'Speech': AudioEffectType.SPEECH,
+              'Music Playing': AudioEffectType.MUSIC}
+    res = []
+    for item in insights[src_key]:
+        for inst in item['instances']:
+            a = AudioEffect(type=ae_map.get(item['type'], AudioEffectType.OTHER),
+                            label=item['type'],
+                            instances=[ConfidenceSegment(**instance2timeseg(inst),
+                                                          confidence=inst['confidence'])])
+            res.append(a)
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = AudioEffects(media_duration=duration)
+        outputs[dest_key].effects.extend(res)
+    return len(res)
+
+
+def do_brands(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    differences = {'brands': ('Brand', NamedEntityType.BRAND),
+                   'namedPeople': ('Person', NamedEntityType.PERSON)}
+    for item in insights[src_key]:
+        for inst in item['instances']:
+            binst = NamedEntity(**instance2timeseg(inst),                                 
+                                confidence=item['confidence'],
+                                tool_private={'instanceSource': inst['instanceSource']},
+                                text=item['name'],
+                                entity_type=differences[src_key][0],
+                                type=differences[src_key][1])
+            for k in ('description', 'referenceId', 'referenceType', 'referenceUri'):
+                if k in item:
+                    binst.tool_private[k] = item[k]
+
+            res.append(binst)
+
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = NamedEntities()
+        outputs[dest_key].spans.extend(res)
+    return len(res)
+
+
+def do_detected_objects(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    for item in insights[src_key]:
+        detobj = DetectedObject(image=thumbnail_cache.get(item['thumbnailId']),
+                                text=item['displayName'],
+                                label=item['type'],
+                                tool_private={'wikidata_id': item.get('wikiDataId', None)})
+        for inst in item['instances']:
+            detobj.instances.append(ConfidenceSegment(**instance2timeseg(inst),
+                                                      confidence=inst['confidence']))            
+        res.append(detobj)
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = DetectedObjects(media_duration=duration)
+        outputs[dest_key].objects.extend(res)
+    return len(res)
+
+
+def do_frame_patterns(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    vpmap = {'Black': VideoPatternType.BLACK,
+            'ColorBars': VideoPatternType.COLORBARS,
+            'RollingCredits': VideoPatternType.CREDITS}
+    for item in insights[src_key]:
+        vpat = VideoPattern(type=vpmap.get(item['patternType'], VideoPatternType.OTHER),
+                            label=item['patternType'])
+        for inst in item['instances']:
+            vpat.instances.append(ConfidenceSegment(**instance2timeseg(inst),
+                                                   confidence=vpat['confidence']))
+        res.append(vpat)
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = VideoPatterns(media_duration=duration)
+        outputs[dest_key].patterns.extend(res)
+    return len(res)
+
+
+def do_labels(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    """Create annotations for labels"""
+    # This is very much like do_annotations but because the data is structured
+    # differently it has to be unrolled in a different fashion.
+    annotations = []
+    for item in insights[src_key]:
+        for inst in item['instances']:
+            a = Annotation(type=AnnotationType.LABEL,
+                           text=item['name'],
+                           language=item.get('language', None),                           
+                           instances=[ConfidenceSegment(**instance2timeseg(inst),
+                                                        confidence=inst['confidence'])])
+            annotations.append(a)
+    # we have to do a bit of a dance because annotations gets called more than once
+    if annotations:
+        if dest_key not in outputs:
+            outputs[dest_key] = Annotations(media_duration=duration)
+        outputs[dest_key].annotations.extend(annotations)        
+    return len(annotations)
+
+def do_named_locations(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    for item in insights[src_key]:
+        for inst in item['instances']:
+            linst = NamedEntity(**instance2timeseg(inst),
+                                confidence=item['confidence'],
+                                tool_private={'description': item['description'],
+                                              'instanceSource': inst['instanceSource'],
+                                              'referenceId': item['referenceId'],                                              
+                                              'referenceUrl': item['referenceUrl']},
+                                text=item['name'],
+                                entity_type="Location",
+                                type=NamedEntityType.LOCATION)            
+            res.append(linst)
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = NamedEntities(media_duration=duration)
+        outputs[dest_key].spans.extend(res)
+    return len(res)
+
+
+def do_ocr(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    for item in insights[src_key]:
+        for inst in item['instances']:
+            vocr = VideoOcrResult(bounding_box=BoundingBox(x1=item['left'],
+                                                           y1=item['top'],
+                                                           x2=item['left'] + item['width'],
+                                                           y2=item['top'] + item['height']),
+                                  angle=item['angle'],
+                                  text=item['text'],
+                                  language=item['language'],
+                                  **instance2timeseg(inst),
+                                  confidence=item['confidence'])
+            res.append(vocr)
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = VideoOcr(media_duration=duration)
+        outputs[dest_key].ocr.extend(res)
+    return len(res)
+
+
+def do_sentiments(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
+    res = []
+    smap = {'Positive': SentimentType.POSITIVE,
+            'Neutral': SentimentType.NEUTRAL,
+            'Negative': SentimentType.NEGATIVE}
+    for item in insights[src_key]:
+        sent = Sentiment(type=smap.get(item['sentimentType'], SentimentType.UNKNOWN),
+                         label=item['sentimentType'],
+                         tool_private={'averageScore': item['averageScore']})
+        for inst in item['instances']:
+            sent.instances.append(Segment(**instance2timeseg(inst)))
+        res.append(sent)    
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = Sentiments(media_duration=duration)
+        outputs[dest_key].sentiments.extend(res)
+    return len(res)
+
+
+def do_transcript(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
     # Load the speaker names.        
     speakers = {}
     if 'speakers' in insights:
@@ -55,261 +310,69 @@ def parse_vi_data(native: dict):
     # Let's get the transcript first.  AVI gives us the audio in paragraph
     # style chunks. We'll populate that and then create the rest of the
     # transcript types from that.        
-    if 'transcript' in insights:
-        transcript = Transcript(media_duration=hhmmss2seconds(insights['duration']),
-                                languages=insights['languages'])
-                
-        for para in insights['transcript']:
-            # I don't know if AVI ever returns more than one instace per
-            # paragraph, but just to be sure, I'm going to iterate. Also,
-            # I'm using adjusted{Start,End} because that's guaranteed to be
-            # relative to the start of the video.
-            for para_instance in para['instances']:
-                p = ParagraphSegment(start_time=hhmmss2seconds(para_instance['adjustedStart']),
-                                                    end_time=hhmmss2seconds(para_instance['adjustedEnd']),
-                                                    text=para['text'],
-                                                    language=para['language'],
-                                                    speaker=speakers.get(para['speakerId'], "Unknown Speaker"),
-                                                    confidence=para['confidence'])
-                transcript.paragraphs.append(p)
+    transcript = Transcript(media_duration=duration,
+                            languages=insights['languages'])
+            
+    for item in insights[src_key]:
+        # I don't know if AVI ever returns more than one instace per
+        # paragraph, but just to be sure, I'm going to iterate.
+        for inst in item['instances']:
+            p = ParagraphSegment(**instance2timeseg(inst),
+                                 text=item['text'],
+                                 language=item['language'],
+                                 speaker=speakers.get(item['speakerId'], "Unknown Speaker"))
+            transcript.paragraphs.append(p)
 
-        # It's really weird the way that AVI returns the paragraphs, so just
-        # to make sure there's not some goofy "They said 'Thank you' 42 times
-        # so we'll bundle it into a single entry", I'm going to sort the 
-        # paragraphs by start time and that should do the trick.
-        transcript.paragraphs = sorted(transcript.paragraphs, key=lambda x: x.start_time) 
-
-        # Paragraphs -> text is pretty easy.
-        transcript.text = " ".join([x.text for x in transcript.paragraphs])
-
-        # Words is harder...because we have to respect the speaker. Also note
-        # that we don't get word-level timestamps.  I'm going to synthesize them
-        # by chopping them into evenly-spaced chunks.  It's obviously not going
-        # to be right, but it's something that's close.
-        for para in transcript.paragraphs:
-            words = para.text.split()
-            duration = para.duration() / len(words)
+            # the confidence (and timestamps) are at the paragraph level, so
+            # that makes things harder.  Since we don't get word-level timestamps
+            # I'm going to synthesize them by splitting them into even-sized
+            # chunks within the paragraph range.
+            pwords = item['text'].split()
+            pduration = p.duration() / len(pwords)
             offset = 0
-            for word in words:
+            for word in pwords:
                 transcript.words.append(WordSegment.from_str(word, 
-                                                                start_time=offset, 
-                                                                end_time=offset + duration,
-                                                                speaker=para.speaker,
-                                                                language=para.language,
-                                                                confidence=para.confidence))
-                
-        tool_output.output.outputs['transcript'] = transcript
-    
-    # Audio effects
-    # should be pretty straightforward
-    if 'audioEffects' in insights:
-        ae_map = {'Silence': AudioEffectType.SILENCE,
-                'Speech': AudioEffectType.SPEECH,
-                'Music Playing': AudioEffectType.MUSIC}
-        audio_effects = AudioEffects(media_duration=transcript.media_duration)    
-        for audio_effect in insights['audioEffects']:
-            for ae_inst in audio_effect['instances']:
-                audio_effects.effects.append(AudioEffectSegment(start_time=hhmmss2seconds(ae_inst['adjustedStart']),
-                                                                end_time=hhmmss2seconds(ae_inst['adjustedEnd']),
-                                                                confidence=ae_inst['confidence'],
-                                                                type=ae_map.get(audio_effect['type'], AudioEffectType.UNKNOWN),
-                                                                label=audio_effect['type'].lower()))
-        tool_output.output.outputs['audio_effects'] = audio_effects
+                                                             start_time=offset, 
+                                                             end_time=offset + pduration,
+                                                             speaker=p.speaker,
+                                                             language=p.language,
+                                                             confidence=item['confidence']))
+    # Paragraphs -> text is pretty easy.
+    transcript.text = " ".join([x.text for x in transcript.paragraphs])
+    outputs[dest_key] = transcript
+    return 1    
 
-    # brands
-    if 'brands' in insights:
-        named_entities = NamedEntities()
-        for brand in insights['brands']:
-            for inst in brand['instances']:
-                binst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                    confidence=brand['confidence'],
-                                    tool_private={'description': brand['description'],
-                                                'instanceSource': inst['instanceSource'],
-                                                'referenceId': brand['referenceId'],
-                                                'referenceType': brand['referenceType'],
-                                                'referenceUrl': brand['referenceUrl']},
-                                    text=brand['name'],
-                                    entity_type="Brand",
-                                    type=NamedEntityType.BRAND)
-                named_entities.spans.append(binst)
-
-        tool_output.output.outputs['named_entities'] = named_entities
-
-    # Setting up the thumbnail cache here to make image instantiation faster.
-    class ThumbnailCache:
-        def __init__(self, data_map: dict):
-            self.data_map = data_map
-            self.cache = dict()
-
-        def get(self, thumbnail_id: str):
-            if thumbnail_id not in self.cache:
-                if thumbnail_id not in self.data_map:
-                    self.cache[thumbnail_id] = None
-                else:                    
-                    pil_img = PIL.Image.open(io.BytesIO(self.data_map[thumbnail_id]))
-                    img = Image(filename=f"{thumbnail_id}.png", image=pil_img)
-                    self.cache[thumbnail_id] = img
-            return self.cache[thumbnail_id]
-
-    thumbnail_cache = ThumbnailCache(native['thumbnails'])
-
-    # detectedObjects
-    if 'detectedObjects' in insights:
-        detected = DetectedObjects(media_duration=hhmmss2seconds(insights['duration']))
-        for obj in insights['detectedObjects']:
-            for inst in obj['instances']:
-                detobj = DetectedObject(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                        end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                        confidence=inst['confidence'],                                    
-                                        image=thumbnail_cache.get(obj['thumbnailId']),
-                                        text=obj['displayName'],                                    
-                                        label=obj['type'],
-                                        tool_private={'wikidata_id': obj['wikiDataId']})
-                                        
-                detected.objects.append(detobj)
-        tool_output.output.outputs['detected_objects'] = detected
-
-    # framePatterns
-    if 'framePatterns' in insights:
-        videopats = VideoPatterns(media_duration=hhmmss2seconds(insights['duration']))
-        vpmap = {'Black': VideoPatternType.BLACK,
-                'ColorBars': VideoPatternType.COLORBARS,
-                'RollingCredits': VideoPatternType.CREDITS,
-                }
-        for pat in insights['framePatterns']:
-            for inst in pat['instances']:
-                vpat = VideoPattern(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                    confidence=pat['confidence'],
-                                    label=pat['patternType'],
-                                    type=vpmap.get(pat['patternType'], VideoPatternType.OTHER))
-                videopats.patterns.append(vpat)
-        tool_output.output.outputs['video_patterns'] = videopats
-
-    # namedLocations
-    if 'namedLocations' in insights:
-        for loc in insights['namedLocations']:
-            for inst in loc['instances']:
-                linst = NamedEntity(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                    confidence=loc['confidence'],
-                                    tool_private={'description': loc['description'],
-                                                'instanceSource': inst['instanceSource'],
-                                                'referenceId': loc['referenceId'],                                              
-                                                'referenceUrl': loc['referenceUrl']},
-                                    text=loc['name'],
-                                    entity_type="Location",
-                                    type=NamedEntityType.LOCATION)
-                named_entities.spans.append(linst)
-
-    # ocr
-    if 'ocr' in insights:
-        videoocr = VideoOcr(media_duration=hhmmss2seconds(insights['duration']))
-        for ocr in insights['ocr']:
-            for inst in ocr['instances']:
-                vocr = VideoOcrResult(x1=ocr['left'],
-                                    y1=ocr['top'],
-                                    x2=ocr['left'] + ocr['width'],
-                                    y2=ocr['top'] - ocr['height'],
-                                    angle=ocr['angle'],
-                                    text=ocr['text'],
-                                    language=ocr['language'],
-                                    start_time=hhmmss2seconds(inst['adjustedStart']),
-                                    end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                    confidence=ocr['confidence'])
-                videoocr.ocr.append(vocr)
-        tool_output.output.outputs['video_ocr'] = videoocr
-
-    # sentiments
-    ssegs = Sentiments(media_duration=hhmmss2seconds(insights['duration']))
-    smap = {'Positive': SentimentType.POSITIVE,
-            'Neutral': SentimentType.NEUTRAL,
-            'Negative': SentimentType.NEGATIVE}
-    if 'sentiments' in insights:
-        for sent in insights['sentiments']:
-            for inst in sent['instances']:
-                sseg = Sentiment(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                 end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                 tool_private={'averageScore': sent['averageScore']},
-                                 type=smap.get(sent['sentimentType'], SentimentType.UNKNOWN),
-                                 label=sent['sentimentType'])
-                ssegs.sentiments.append(sseg)
-        if ssegs.sentiments:
-            tool_output.output.outputs['sentiments'] = ssegs
-
-    # scenes & shots
-    vsegs = VideoSegments(media_duration=hhmmss2seconds(insights['duration']))
-    for skey, stype, slabel in (('scenes', VideoSegmentType.SCENE, 'Scene'),
-                               ('shots', VideoSegmentType.SHOT, 'Shot')):
-        if skey in insights:
-            for sthing in insights[skey]:
-                keyframes = []
-                for keyframe in sthing.get('keyFrames', []):
-                    for kinst in keyframe['instances']:
-                        keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
-                                        frame=thumbnail_cache.get(kinst['thumbnailId'])))
-                for inst in sthing['instances']:
-                    sinst = VideoSegment(start_time=hhmmss2seconds(inst['adjustedStart']),
-                                        end_time=hhmmss2seconds(inst['adjustedEnd']),
-                                        type=stype,
-                                        label=slabel,
-                                        keyframes=keyframes)
-                    vsegs.segments.append(sinst)
-    if vsegs.segments:
-        tool_output.output.outputs['video_segments'] = vsegs
-
-    # keywords, labels, topics
-    anno = Annotations(media_duration=hhmmss2seconds(insights['duration']))
-    for akey, atype, nkey, tkeys, iconf in (('keywords', AnnotationType.KEYWORD, 'text', [], False),
-                                            ('labels', AnnotationType.LABEL, 'name', [], True),
-                                            ('topics', AnnotationType.TOPIC, 'name', ('iabName', 'iptcName', 'referenceId', 'referenceType', 'referenceUrl'), False)):
-        if akey in insights:
-            for athing in insights[akey]:            
-                for ainst in athing['instances']:
-                    a = Annotation(start_time=hhmmss2seconds(ainst['adjustedStart']),
-                                end_time=hhmmss2seconds(ainst['adjustedEnd']),
-                                type=atype,
-                                text=athing[nkey])
-                    a.confidence = ainst['confidence'] if iconf else athing['confidence']
-                    if tkeys:
-                        a.tool_private = dict()
-                        for k in tkeys:
-                            a.tool_private[k] = athing.get(k, None)
-                    anno.annotations.append(a)
-                    
-    if anno.annotations:
-        tool_output.output.outputs['annotations'] = anno
-
-    return tool_output
-
-
-def key_finder(data: Any, key: str) -> list:
-    """Find the values for the given key no matter where
-       it is in the data structure"""
+def do_video_segments(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
     res = []
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k == key:
-                res.append(v)
-            else:
-                if isinstance(v, dict):
-                    res.extend(key_finder(v, key))
-                elif isinstance(v, (list, set, tuple)):
-                    for i in v:
-                        res.extend(key_finder(i, key))
-    elif isinstance(data, (set, list, tuple)):
-        for i in data:
-            res.extend(key_finder(i, key))
+    # scenes and shots are structurally similar, with the biggest difference
+    # being that shots have keyframes and scenes do not. 
+    differences={'scenes': VideoSegmentType.SCENE,
+                 'shots': VideoSegmentType.SHOT}
+    for item in insights[src_key]:        
+        keyframes = []
+        for keyframe in item.get('keyFrames', []):
+            for kinst in keyframe['instances']:
+                keyframes.append(KeyFrame(time=hhmmss2seconds(kinst['adjustedStart']),
+                                          frame=thumbnail_cache.get(kinst['thumbnailId'])))
+        for inst in item['instances']:
+            sinst = VideoSegment(**instance2timeseg(inst),
+                                 type=differences[src_key],
+                                 label=str(differences[src_key]).capitalize(),
+                                 keyframes=keyframes)
+            res.append(sinst)
 
-    return res
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = VideoSegments(media_duration=duration)
+        outputs[dest_key].segments.extend(res)
+    return len(res)
 
 
-if __name__ == "__main__":
-    import yaml
-    import PIL.Image
-    with open("../../test.yaml") as f:
-        data = yaml.safe_load(f)
-    
-    t = parse_vi_data(data)
-    print(t.model_dump_yaml())
+def instance2timeseg(inst: dict) -> dict:
+    """Convert an instance timestamp into a dict"""
+    # I'm using adjusted{Start,End} because that's guaranteed to be
+    # relative to the start of the video.
+
+    return {'start_time': hhmmss2seconds(inst['adjustedStart']),
+            'end_time': hhmmss2seconds(inst['adjustedEnd'])}
+

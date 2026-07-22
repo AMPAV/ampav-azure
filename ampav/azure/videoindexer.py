@@ -11,9 +11,9 @@ import requests
 import time
 
 from ampav.core.schema.tool import ToolOutput
-from ampav.core.utils import dump_data, load_data
+from ampav.core.utils import dump_data, load_data, key_finder
 from .vi_models import JobStatus, JobState, ViRawData
-from .vi_utils import key_finder, parse_vi_data
+from .vi_utils import parse_vi_data
 from urllib.parse import urlparse
 
 import json
@@ -197,8 +197,15 @@ class AzureVideoIndexer(AsyncTool):
             self.cleanup(job_id)
             raise ToolError("The job has failed")
         
-        # get the video indexer information
-        r = requests.get(url=f"{self.api_url_base}/Videos/{job.job_id}/Index",
+
+        res = self._fetch(job_id)
+        self.cleanup(job_id)
+        return AzureVideoIndexer.native_to_tool_output(res)
+
+
+    def _fetch(self, job_id: str) -> dict:
+        """Fetch the raw data from VideoIndexer"""        
+        r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/Index",
                          params={
                             'accessToken': self._get_access_token(),
                             'language': 'English',
@@ -232,9 +239,9 @@ class AzureVideoIndexer(AsyncTool):
             else:
                 logging.warning(f"Cannot retrieve thumbnail {thumbId}")
 
-        self.cleanup(job_id)
-        self._rawdata = ViRawData(**res)
-        return AzureVideoIndexer.native_to_tool_output(res)
+
+        return res
+
 
 
     @staticmethod
@@ -303,12 +310,12 @@ def main():
     cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
     cmd.add_argument("--output", type=Path, help="Output file")
     
-    cmd = subp.add_parser("dumpraw", help="Dump a raw videoindexer output (for debugging only)")
+    cmd = subp.add_parser("fetchraw", help="Fetch the raw videoindexer output (for debugging only)")
     cmd.add_argument("job_id", help="Job Id to dump")
     cmd.add_argument("--format", choices=['yaml', 'pickle'], default='yaml', help="Output format")
     cmd.add_argument("--output", type=Path, help="Output file")
     
-    cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects (for debugging only)")
+    cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects")
     cmd.add_argument("rawfile", type=Path, help="Raw file data")
     cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
     cmd.add_argument("--output", type=Path, help="Output file")
@@ -363,13 +370,14 @@ def main():
             else:
                 dump_data(result, args.format, args.output)
 
-        case "dumpraw":
-            result = vi.get_result(args.job_id)
+        case "fetchraw":
+            job: AsyncJobStatus = vi.get_status(args.job_id)
+            if job.status != AsyncStatusCode.SUCCEEDED:
+                logging.warning(f"Cannot fetch data as the job is in state {job.status}")
+                exit(1)
+            result = vi._fetch(args.job_id)            
             logging.info("Got the results.")
-            if result is None:
-                logging.info("The job is not ready yet")
-            else:
-                dump_data(vi._rawdata, args.format, args.output)
+            dump_data(result, args.format, args.output)
 
         case "parseraw":          
             data = load_data(args.rawfile)

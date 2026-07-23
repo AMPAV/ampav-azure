@@ -1,7 +1,7 @@
 #!/bin/env python3.12
 from pathlib import Path
 
-from ampav.core.logging import LOG_FORMAT
+from ampav.core.logging import LOG_FORMAT, ListLoggingHandler
 from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode, ToolError
 import argparse
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
@@ -216,22 +216,27 @@ class AzureVideoIndexer(AsyncTool):
                'data': r.json(),
                'thumbnails': {}}
         # look for other artifacts
-        for artifact in ('Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
-                         'KeyframesThumbnails', 'Emotions', 'TextualContentModeration',
-                         'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
-                         'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
-                         'TextlessMaterial', 'Logos', 'DetectedObjects'):
-            r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
-                             params={'type': artifact,
-                                     'accessToken': self._get_access_token()})            
-            if r.status_code == 200:
-                artifact_url = r.text.strip('"')
-                
-                r = requests.get(url=artifact_url)
-                try:
-                    res[artifact.lower()] = json.loads(r.content)
-                except:
-                    res[artifact.lower()] = r.content
+        if False:
+            # There's a lot of good data there, but it's a whole separate
+            # project -- the ThumbNails are zip files everything has structure
+            # that's not defined in the API, etc.  It's an absolute mess, so 
+            # I'm going to ignore it...for now.            
+            for artifact in ('Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
+                            'KeyframesThumbnails', 'Emotions', 'TextualContentModeration',
+                            'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
+                            'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
+                            'TextlessMaterial', 'Logos', 'DetectedObjects'):
+                r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
+                                params={'type': artifact,
+                                        'accessToken': self._get_access_token()})            
+                if r.status_code == 200:
+                    artifact_url = r.text.strip('"')
+                    
+                    r = requests.get(url=artifact_url)
+                    try:
+                        res[artifact.lower()] = json.loads(r.content)
+                    except:
+                        res[artifact.lower()] = r.content
         # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
         # find all the thumbnails
         thumb_base = f"{self.api_url_base}/Videos/{job_id}/Thumbnails"
@@ -358,7 +363,22 @@ def main():
             print(job_id)
 
         case "process":
+            # capture logging to an array
+            logs = []
+            loghandler = ListLoggingHandler(logs)
+            logging.getLogger().addHandler(loghandler)
+            
+            # run the job
+            start = time.time()
             result = vi.process(args.video_url)
+
+            # update the tool_output structure with the runtime things            
+            result.start_time = start
+            result.end_time = time.time()
+            result.messages = logs
+            result.parameters['url'] = args.video_url
+
+            # return the result to the user
             dump_data(result, args.format, args.output)
                         
         case "status":

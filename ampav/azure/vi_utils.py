@@ -58,6 +58,7 @@ def parse_vi_data(native: dict):
                'detectedObjects': ['detected_objects', do_detected_objects],
                'duration': [None, None],
                'emotions': ['annotations', do_annotations],
+               'faces': [None, None],  # probably should do this some day
                'framePatterns': ['frame_patterns', do_frame_patterns],
                'keywords': ['annotations', do_annotations],
                'labels': ['annotations', do_labels],
@@ -78,7 +79,8 @@ def parse_vi_data(native: dict):
                'textualContentModeration': [None, None],
                'topics': ['annotations', do_annotations],
                'transcript': ['transcript', do_transcript],
-               'version': [None, None]
+               'version': [None, None],
+               'visualContentModeration': [None, None]
                }
 
     # many things need the duration, so let's compute it here
@@ -210,7 +212,7 @@ def do_frame_patterns(duration: float, insights: dict, src_key: str, outputs: di
                             label=item['patternType'])
         for inst in item['instances']:
             vpat.instances.append(ConfidenceSegment(**instance2timeseg(inst),
-                                                   confidence=vpat['confidence']))
+                                                   confidence=item['confidence']))
         res.append(vpat)
     if res:
         if dest_key not in outputs:
@@ -264,10 +266,10 @@ def do_ocr(duration: float, insights: dict, src_key: str, outputs: dict, dest_ke
     res = []
     for item in insights[src_key]:
         for inst in item['instances']:
-            vocr = VideoOcrResult(bounding_box=BoundingBox(x1=item['left'],
-                                                           y1=item['top'],
-                                                           x2=item['left'] + item['width'],
-                                                           y2=item['top'] + item['height']),
+            vocr = VideoOcrResult(bounding_box=BoundingBox(x=item['left'],
+                                                           y=item['top'],
+                                                           width=item['width'],
+                                                           height=item['height']),
                                   angle=item['angle'],
                                   text=item['text'],
                                   language=item['language'],

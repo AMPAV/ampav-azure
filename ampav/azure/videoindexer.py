@@ -120,6 +120,7 @@ class AzureVideoIndexer(AsyncTool):
 
         r.raise_for_status()
         job = JobStatus(**r.json())
+        logging.debug(f"Submitted VI job {job.id}")
         return job.id
     
 
@@ -205,6 +206,7 @@ class AzureVideoIndexer(AsyncTool):
 
     def _fetch(self, job_id: str) -> dict:
         """Fetch the raw data from VideoIndexer"""        
+        logging.debug(f"Retrieving results for job {job_id}")
         r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/Index",
                          params={
                             'accessToken': self._get_access_token(),
@@ -239,6 +241,7 @@ class AzureVideoIndexer(AsyncTool):
                         res[artifact.lower()] = r.content
         # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
         # find all the thumbnails
+        logging.debug(f"Retrieving thumbnails for {job_id}")
         thumb_base = f"{self.api_url_base}/Videos/{job_id}/Thumbnails"
         for thumbId in set(key_finder(res['data'], 'thumbnailId')):
             r = requests.get(url=f"{thumb_base}/{thumbId}", 
@@ -275,7 +278,7 @@ class AzureVideoIndexer(AsyncTool):
         except KeyError:
             return
 
-        logging.info(f"Removing Video Indexer Job {job_id}")
+        logging.debug(f"Removing Video Indexer Job {job_id}")
         video_url = f"{self.api_url_base}/Videos/{job_id}"
         requests.delete(url=video_url,
                         params={'accessToken': self._get_access_token()})

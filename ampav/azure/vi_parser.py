@@ -47,7 +47,8 @@ def parse_vi_data(native: dict):
     # directly from AVI) look like what we're generating.
     if native.get('format', None) != 'viraw' and 'data' not in native.keys():
         native = {'data': native,
-                  'thumbnails': {}}
+                  'thumbnails': {},
+                  'artifacts': {}}
 
     video = native['data']['videos'][0]
     insights = video['insights']
@@ -150,12 +151,12 @@ def do_audio_effects(duration: float, insights: dict, src_key: str, outputs: dic
               'Music Playing': AudioEffectType.MUSIC}
     res = []
     for item in insights[src_key]:
+        a = AudioEffect(type=ae_map.get(item['type'], AudioEffectType.OTHER),
+                                    label=item['type'])
         for inst in item['instances']:
-            a = AudioEffect(type=ae_map.get(item['type'], AudioEffectType.OTHER),
-                            label=item['type'],
-                            instances=[ConfidenceSegment(**instance2timeseg(inst),
-                                                          confidence=inst['confidence'])])
-            res.append(a)
+            a.instances.append(ConfidenceSegment(**instance2timeseg(inst),
+                                                 confidence=inst['confidence']))
+        res.append(a)
     if res:
         if dest_key not in outputs:
             outputs[dest_key] = AudioEffects(media_duration=duration)
@@ -166,7 +167,7 @@ def do_audio_effects(duration: float, insights: dict, src_key: str, outputs: dic
 def do_brands(duration: float, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache):
     res = []
     differences = {'brands': ('Brand', NamedEntityType.BRAND),
-                   'namedPeople': ('Person', NamedEntityType.PERSON)}
+                   'namedPeople': ('namedPerson', NamedEntityType.PERSON)}
     for item in insights[src_key]:
         for inst in item['instances']:
             binst = NamedEntity(**instance2timeseg(inst),                                 
@@ -229,15 +230,14 @@ def do_labels(duration: float, insights: dict, src_key: str, outputs: dict, dest
     """Create annotations for labels"""
     # This is very much like do_annotations but because the data is structured
     # differently it has to be unrolled in a different fashion.
-    annotations = []
+    annotations = []    
     for item in insights[src_key]:
+        a = Annotation(type=AnnotationType.LABEL,
+                       text=item['name'],
+                       language=item.get('language', None))
         for inst in item['instances']:
-            a = Annotation(type=AnnotationType.LABEL,
-                           text=item['name'],
-                           language=item.get('language', None),                           
-                           instances=[ConfidenceSegment(**instance2timeseg(inst),
-                                                        confidence=inst['confidence'])])
-            annotations.append(a)
+             a.instances.append(ConfidenceSegment(**instance2timeseg(inst), confidence=inst['confidence']))
+        annotations.append(a)
     # we have to do a bit of a dance because annotations gets called more than once
     if annotations:
         if dest_key not in outputs:
@@ -257,7 +257,7 @@ def do_named_locations(duration: float, insights: dict, src_key: str, outputs: d
                                               'referenceId': item['referenceId'],                                              
                                               'referenceUrl': item['referenceUrl']},
                                 text=item['name'],
-                                entity_type="Location",
+                                entity_type="namedLocation",
                                 type=NamedEntityType.LOCATION)            
             res.append(linst)
     if res:
@@ -336,7 +336,7 @@ def do_transcript(duration: float, insights: dict, src_key: str, outputs: dict, 
             # chunks within the paragraph range.
             pwords = item['text'].split()
             pduration = p.duration() / len(pwords)
-            offset = 0
+            offset = p.start_time
             for word in pwords:
                 transcript.words.append(WordSegment.from_str(word, 
                                                              start_time=offset, 
@@ -344,6 +344,7 @@ def do_transcript(duration: float, insights: dict, src_key: str, outputs: dict, 
                                                              speaker=p.speaker,
                                                              language=p.language,
                                                              confidence=item['confidence']))
+                offset += pduration
     # Paragraphs -> text is pretty easy.
     transcript.text = " ".join([x.text for x in transcript.paragraphs])
     outputs[dest_key] = transcript

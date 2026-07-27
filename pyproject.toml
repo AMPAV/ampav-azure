@@ -1,6 +1,6 @@
 [project]
 name = "ampav-azure"
-version = "0.0.1"
+version = "0.1.0"
 description = "Azure tooling for the AMPAV environment"
 readme = "README.md"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ authors = [
 
 requires-python = ">=3.12"
 dependencies = [
-    "ampav-core>=0.0.12",
+    "ampav-core>=0.0.19",
     "azure-identity",
 ]
 
@@ -25,7 +25,7 @@ Issues = "https://github.com/AMPAV/ampav-azure/issues"
 
 
 [project.scripts]
-
+ampav_azure_video_indexer = "ampav.azure.videoindexer:main"
 
 [build-system]
 requires = ["setuptools"]

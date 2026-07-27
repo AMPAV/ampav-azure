@@ -12,10 +12,11 @@ import time
 
 from ampav.core.schema.tool import ToolOutput
 from ampav.core.utils import dump_data, load_data, key_finder
-from .vi_models import JobStatus, JobState, ViRawData
-from .vi_utils import parse_vi_data
+from .models import JobStatus, JobState, ViRawData
+from .vi_parser import parse_vi_data
 from urllib.parse import urlparse
-
+from ampav.core.schema import load_ampav_file
+from ampav.azure.render import render_data
 import json
 
 # chunks shamelessly stolen from 
@@ -216,11 +217,12 @@ class AzureVideoIndexer(AsyncTool):
         r.raise_for_status()
         res = {'format': 'viraw',
                'data': r.json(),
-               'thumbnails': {}}
+               'thumbnails': {},
+               'artifacts': {}}
         # look for other artifacts
         if False:
             # There's a lot of good data there, but it's a whole separate
-            # project -- the ThumbNails are zip files everything has structure
+            # project -- the ThumbNails are zip files, everything has structure
             # that's not defined in the API, etc.  It's an absolute mess, so 
             # I'm going to ignore it...for now.            
             for artifact in ('Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
@@ -236,9 +238,10 @@ class AzureVideoIndexer(AsyncTool):
                     
                     r = requests.get(url=artifact_url)
                     try:
-                        res[artifact.lower()] = json.loads(r.content)
+                        res['artifacts'][artifact.lower()] = json.loads(r.content)
                     except:
-                        res[artifact.lower()] = r.content
+                        res['artifacts'][artifact.lower()] = r.content
+
         # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
         # find all the thumbnails
         logging.debug(f"Retrieving thumbnails for {job_id}")
@@ -293,7 +296,7 @@ def main():
     parser.add_argument('--azure_client_id', type=str, help='Azure Client ID (default: environment or az login)')
     parser.add_argument('--azure_tenant_id', type=str, help='Azure Tenant ID (default: environment or az login)')
     parser.add_argument('--azure_client_secret', type=str, help='Azure Client Secret (default: environment or az login)')
-    
+        
     subp = parser.add_subparsers(dest="command", help="Sub-commands", required=True)
     cmd = subp.add_parser("list", help="List Video Indexer jobs")
     cmd.add_argument("--format", choices=['yaml', 'json'], default='yaml', help="Output format")
@@ -329,7 +332,19 @@ def main():
     cmd.add_argument("rawfile", type=Path, help="Raw file data")
     cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
     cmd.add_argument("--output", type=Path, help="Output file")
-    
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+
+    cmd = subp.add_parser("render", help="Render an AMPAV AVI tool output into html")
+    cmd.add_argument("input", type=Path, help="AMPAV AVI Tool output")
+    cmd.add_argument("output", type=Path, help="Rendered HTML output file")
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+
+    cmd = subp.add_parser("convert", help="Convert from one format to another")
+    cmd.add_argument("input", type=Path, help="Data file")
+    cmd.add_argument("output", type=Path, help="Rendered HTML output file")
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+    cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
+
     args = parser.parse_args()
 
     logging.basicConfig(format=LOG_FORMAT, level=logging.DEBUG if args.debug else logging.INFO)
@@ -372,6 +387,7 @@ def main():
             logging.getLogger().addHandler(loghandler)
             
             # run the job
+            logging.info("Starting processing")
             start = time.time()
             result = vi.process(args.video_url)
 
@@ -382,6 +398,7 @@ def main():
             result.parameters['url'] = args.video_url
 
             # return the result to the user
+            logging.info("Saving data")
             dump_data(result, args.format, args.output)
                         
         case "status":
@@ -405,11 +422,23 @@ def main():
             dump_data(result, args.format, args.output)
 
         case "parseraw":          
-            data = load_data(args.rawfile)
+            data = load_data(args.rawfile, args.allow_pickle)
             if isinstance(data, dict):
                 data = ViRawData(**data)
             vidata = AzureVideoIndexer.native_to_tool_output(data.model_dump())
             dump_data(vidata, args.format, args.output)
+
+        case "render":
+            logging.info("Loading data")
+            data: ToolOutput = load_ampav_file(args.input, args.allow_pickle)
+            logging.info("Rendering data")
+            args.output.write_text(render_data(data, args.input.name))
+
+        case "convert":
+            logging.info("Loading data.")
+            data = load_data(args.input, args.allow_pickle)
+            logging.info("Saving data.")
+            dump_data(data, args.format, args.output)
 
 
 if __name__ == "__main__":

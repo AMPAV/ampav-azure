@@ -31,5 +31,5 @@ class ViRawData(AmpAVBaseModel):
     format: Literal['viraw'] = 'viraw'
     data: dict
     thumbnails: dict = Field(default_factory=dict)
-    ocr: dict = Field(default_factory=dict)
-    faces: dict = Field(default_factory=dict)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    

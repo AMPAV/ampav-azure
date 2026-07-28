@@ -1,6 +1,8 @@
 #!/bin/env python3.12
 from pathlib import Path
 
+import yaml
+
 from ampav.core.logging import LOG_FORMAT, ListLoggingHandler
 from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode, ToolError
 import argparse
@@ -177,7 +179,7 @@ class AzureVideoIndexer(AsyncTool):
         for j in self.list_jobs():
             if j.job_id == job_id:
                 return j
-        return KeyError(f"Job id {job_id} doesn't exist")
+        raise KeyError(f"Job id {job_id} doesn't exist")
     
     
     def get_result(self, job_id: str) -> ToolOutput | None:
@@ -205,7 +207,7 @@ class AzureVideoIndexer(AsyncTool):
         return AzureVideoIndexer.native_to_tool_output(res)
 
 
-    def _fetch(self, job_id: str) -> dict:
+    def _fetch(self, job_id: str, artifacts: bool=False) -> dict:
         """Fetch the raw data from VideoIndexer"""        
         logging.debug(f"Retrieving results for job {job_id}")
         r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/Index",
@@ -220,7 +222,7 @@ class AzureVideoIndexer(AsyncTool):
                'thumbnails': {},
                'artifacts': {}}
         # look for other artifacts
-        if False:
+        if artifacts:
             # There's a lot of good data there, but it's a whole separate
             # project -- the ThumbNails are zip files, everything has structure
             # that's not defined in the API, etc.  It's an absolute mess, so 
@@ -327,6 +329,7 @@ def main():
     cmd.add_argument("job_id", help="Job Id to dump")
     cmd.add_argument("--format", choices=['yaml', 'pickle'], default='yaml', help="Output format")
     cmd.add_argument("--output", type=Path, help="Output file")
+    cmd.add_argument("--artifacts", action="store_true", help="Attach additional artifacts")
     
     cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects")
     cmd.add_argument("rawfile", type=Path, help="Raw file data")
@@ -338,6 +341,7 @@ def main():
     cmd.add_argument("input", type=Path, help="AMPAV AVI Tool output")
     cmd.add_argument("output", type=Path, help="Rendered HTML output file")
     cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+    cmd.add_argument("--raw", action="store_true", help="Load non-AMPAV data")
 
     cmd = subp.add_parser("convert", help="Convert from one format to another")
     cmd.add_argument("input", type=Path, help="Data file")
@@ -393,12 +397,12 @@ def main():
 
             # update the tool_output structure with the runtime things            
             result.start_time = start
-            result.end_time = time.time()
-            result.messages = logs
+            result.end_time = time.time()            
             result.parameters['url'] = args.video_url
 
             # return the result to the user
             logging.info("Saving data")
+            result.messages = logs
             dump_data(result, args.format, args.output)
                         
         case "status":
@@ -417,7 +421,7 @@ def main():
             if job.status != AsyncStatusCode.SUCCEEDED:
                 logging.warning(f"Cannot fetch data as the job is in state {job.status}")
                 exit(1)
-            result = vi._fetch(args.job_id)            
+            result = vi._fetch(args.job_id, args.artifacts)            
             logging.info("Got the results.")
             dump_data(result, args.format, args.output)
 
@@ -430,7 +434,11 @@ def main():
 
         case "render":
             logging.info("Loading data")
-            data: ToolOutput = load_ampav_file(args.input, args.allow_pickle)
+            if args.raw:
+                with open(args.input) as f:
+                    data = yaml.safe_load(f)
+            else:
+                data: ToolOutput = load_ampav_file(args.input, args.allow_pickle)
             logging.info("Rendering data")
             args.output.write_text(render_data(data, args.input.name))
 

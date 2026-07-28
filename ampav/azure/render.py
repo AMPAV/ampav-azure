@@ -9,6 +9,7 @@ from typing import Any
 from ampav.core.schema import *
 from html import escape
 from ampav.core.schema.basemodel import AmpAVBaseModel
+from base64 import b64encode
 
 def render_data(result: Any, title: str) -> str:
 
@@ -41,6 +42,8 @@ def render_data(result: Any, title: str) -> str:
                 return f"{data:0.2f}"
             case bool():
                 return f"<b>{data}</b>"
+            case bytes():
+                return b64encode(data).decode()
             case None:
                 return "<b>None</b>"
             case _:

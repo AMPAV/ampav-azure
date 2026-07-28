@@ -225,13 +225,15 @@ class AzureVideoIndexer(AsyncTool):
         if artifacts:
             # There's a lot of good data there, but it's a whole separate
             # project -- the ThumbNails are zip files, everything has structure
-            # that's not defined in the API, etc.  It's an absolute mess, so 
-            # I'm going to ignore it...for now.            
-            for artifact in ('Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
+            # that's not defined in the API, etc.  It's an absolute mess
+            all_artifacts = ['Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
                             'KeyframesThumbnails', 'Emotions', 'TextualContentModeration',
                             'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
                             'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
-                            'TextlessMaterial', 'Logos', 'DetectedObjects'):
+                            'TextlessMaterial', 'Logos', 'DetectedObjects']         
+            usable_artifacts = ['Emotions', 'TextualContentModeration', 'Transcript']
+            
+            for artifact in all_artifacts:
                 r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
                                 params={'type': artifact,
                                         'accessToken': self._get_access_token()})            
@@ -417,6 +419,7 @@ def main():
                 dump_data(result, args.format, args.output)
 
         case "fetchraw":
+            logging.info("Requesting results")
             job: AsyncJobStatus = vi.get_status(args.job_id)
             if job.status != AsyncStatusCode.SUCCEEDED:
                 logging.warning(f"Cannot fetch data as the job is in state {job.status}")
@@ -424,13 +427,18 @@ def main():
             result = vi._fetch(args.job_id, args.artifacts)            
             logging.info("Got the results.")
             dump_data(result, args.format, args.output)
+            logging.info("Finished writing data")
 
         case "parseraw":          
+            logging.info("Loading the data")
             data = load_data(args.rawfile, args.allow_pickle)
             if isinstance(data, dict):
                 data = ViRawData(**data)
+            logging.info("Processing the data")
             vidata = AzureVideoIndexer.native_to_tool_output(data.model_dump())
+            logging.info("Writing the output")
             dump_data(vidata, args.format, args.output)
+            logging.info("Output finished")
 
         case "render":
             logging.info("Loading data")

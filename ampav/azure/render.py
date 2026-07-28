@@ -10,6 +10,9 @@ from ampav.core.schema import *
 from html import escape
 from ampav.core.schema.basemodel import AmpAVBaseModel
 from base64 import b64encode
+from PIL.Image import Image as PILImage
+
+from ampav.core.schema.image import serialize_pil_image
 
 def render_data(result: Any, title: str) -> str:
 
@@ -17,8 +20,12 @@ def render_data(result: Any, title: str) -> str:
         match data:
             case AmpAVBaseModel():
                 x = f"<h3>{data.__module__}</h3>"
-                x += dump_structure(data.model_dump())
+                x += dump_structure({k: getattr(data, k) for k in data.__class__.model_fields.keys()})
+                #x += dump_structure(data.model_dump())
+                
                 return x
+            case PILImage():
+                return f'<img src="{serialize_pil_image(data)}">'                
             case str():
                 if data.startswith('data:image/png;base64,'):
                     return f'<img src="{data}">'

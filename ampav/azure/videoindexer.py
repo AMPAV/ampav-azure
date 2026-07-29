@@ -18,7 +18,7 @@ from .models import JobStatus, JobState, ViRawData
 from .vi_parser import parse_vi_data
 from urllib.parse import urlparse
 from ampav.core.schema import load_ampav_file
-from ampav.azure.render import render_data
+from ampav.core.render import render_html
 import json
 
 # chunks shamelessly stolen from 
@@ -231,7 +231,8 @@ class AzureVideoIndexer(AsyncTool):
                             'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
                             'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
                             'TextlessMaterial', 'Logos', 'DetectedObjects']         
-            usable_artifacts = ['Emotions', 'TextualContentModeration', 'Transcript']
+            usable_artifacts = ['Emotions', 'TextualContentModeration', 'Transcript',
+                                'FacesThumbnails']
             
             for artifact in all_artifacts:
                 r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
@@ -448,7 +449,7 @@ def main():
             else:
                 data: ToolOutput = load_ampav_file(args.input, args.allow_pickle)
             logging.info("Rendering data")
-            args.output.write_text(render_data(data, args.input.name))
+            args.output.write_text(render_html(data, args.input.name))
 
         case "convert":
             logging.info("Loading data.")

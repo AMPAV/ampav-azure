@@ -1,12 +1,13 @@
 #!/bin/env python3.12
 import io
 from typing import Any
+import zipfile
 
 import yaml
 from ampav.core.schema.annotation import Annotation, AnnotationType, Annotations
 from ampav.core.schema.audio import AudioEffect, AudioEffectType, AudioEffects, AudioEffect
 from ampav.core.schema.named_entity import NamedEntities, NamedEntity, NamedEntityType
-from ampav.core.schema.object import DetectedObject, DetectedObjects
+from ampav.core.schema.object import DetectedObject, DetectedObjectInstance, DetectedObjectType, DetectedObjects
 from ampav.core.schema.sentiment import Sentiment, SentimentType, Sentiments
 from ampav.core.schema.transcript import Transcript
 from ampav.core.schema.video import KeyFrame, VideoOcr, VideoOcrResult, VideoPattern, VideoPatternType, VideoPatterns, VideoSegment, VideoSegmentType, VideoSegments
@@ -62,7 +63,7 @@ def parse_vi_data(native: dict):
                'detectedObjects': ['detected_objects', do_detected_objects],
                'duration': [None, None],
                'emotions': ['annotations', do_emotions],
-               'faces': [None, None],  # probably should do this some day
+               'faces': ['faces', do_faces],  
                'framePatterns': ['frame_patterns', do_frame_patterns],
                'keywords': ['annotations', do_annotations],
                'labels': ['annotations', do_labels],
@@ -201,13 +202,14 @@ def do_brands(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict
 def do_detected_objects(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache, artifacts: dict):
     res = []
     for item in insights[src_key]:
-        detobj = DetectedObject(image=thumbnail_cache.get(item['thumbnailId']),
+        detobj = DetectedObject(type=DetectedObjectType.OBJECT,
+                                image=thumbnail_cache.get(item['thumbnailId']),
                                 text=item['displayName'],
                                 label=item['type'],
                                 tool_private={'wikidata_id': item.get('wikiDataId', None)})
         for inst in item['instances']:
-            detobj.instances.append(ConfidenceSegment(**instance2timeseg(inst),
-                                                      confidence=inst['confidence']))            
+            detobj.instances.append(DetectedObjectInstance(**instance2timeseg(inst),
+                                                           confidence=inst['confidence']))            
         res.append(detobj)
     if res:
         if dest_key not in outputs:
@@ -244,6 +246,47 @@ def do_emotions(media_info: MediaInfo, insights: dict, src_key: str, outputs: di
             outputs[dest_key] = Annotations(media_duration=media_info.duration)
         outputs[dest_key].annotations.extend(res)
         outputs[dest_key].merge_instances()
+
+
+
+def do_faces(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache, artifacts: dict):
+    res = []
+    # check to see if we have face thumbnails and set up a cache
+    face_cache = None
+    if 'facesthumbnails' in artifacts:
+        face_cache = zipfile.ZipFile(io.BytesIO(artifacts['facesthumbnails']))
+
+    def get_face(item, face_id):
+        "Get a face out of the zipfile by id"
+        if face_cache is None:
+            return None        
+        for thumbent in item['thumbnails']:
+            if thumbent['id'] == face_id:                
+                face_file = thumbent['fileName']
+                if face_file not in face_cache.namelist():
+                    return None
+                pil_img = PIL.Image.open(io.BytesIO(face_cache.read(face_file)))
+                return Image(filename=face_file, image=pil_img)                
+        return None
+
+    for item in insights[src_key]:
+        f = DetectedObject(type=DetectedObjectType.FACE,
+                           image=thumbnail_cache.get(item['thumbnailId']),
+                           text=item['name'])
+        for inst in item['instances']:
+            
+            doi = DetectedObjectInstance(**instance2timeseg(inst))
+            for thumbid in inst.get('thumbnailsIds', []):
+                face_img = get_face(item, thumbid)
+                doi.images.append(face_img)
+            f.instances.append(doi)
+        res.append(f)
+
+    if res:
+        if dest_key not in outputs:
+            outputs[dest_key] = DetectedObjects(media_duration=media_info.duration)
+        outputs[dest_key].objects.extend(res)
+    return len(res)
 
 
 def do_frame_patterns(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache, artifacts: dict):
@@ -355,9 +398,10 @@ def do_textual_content_moderation(media_info: MediaInfo, insights: dict, src_key
             a = Annotation(type=AnnotationType.MATURE,
                            label="mature_language",
                            text=item['Word'])
-            for inst in tcm['Instances']:
-                a.instances.append(Segment(**instance2timeseg(inst),
-                                           tool_private={'Type': inst['Type']}))
+            for inst in item['Instances']:
+                a.instances.append(ConfidenceSegment(start_time=hhmmss2seconds(inst['AdjustedStart']),
+                                                     end_time=hhmmss2seconds(inst['AdjustedEnd']),
+                                                     tool_private={'Type': inst['Type']}))
             res.append(a)
     else:
         # the summarized version doesn't give us anything, so we're going to
@@ -375,7 +419,6 @@ def do_textual_content_moderation(media_info: MediaInfo, insights: dict, src_key
         outputs[dest_key].annotations.extend(res)      
         outputs[dest_key].merge_instances()  
     return len(res)
-
 
 
 def do_transcript(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict, dest_key: str, thumbnail_cache: ThumbnailCache, artifacts: dict):

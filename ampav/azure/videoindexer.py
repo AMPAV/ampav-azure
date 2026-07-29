@@ -1,9 +1,9 @@
 #!/bin/env python3.12
-from typing import Any
+from pathlib import Path
 
-from pydantic import ConfigDict
+import yaml
 
-from ampav.core.logging import LOG_FORMAT
+from ampav.core.logging import LOG_FORMAT, ListLoggingHandler
 from ampav.core.async_tool import AsyncTool, AsyncJobStatus, AsyncStatusCode, ToolError
 import argparse
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
@@ -11,21 +11,18 @@ import logging
 import os
 import requests
 import time
-from ampav.core.schema.transcript import Transcript
-from ampav.core.utils import hhmmss2seconds
-from ampav.core.schema.basemodel import AmpAVBaseModel
-from ampav.core.schema.compound import CompoundOutput
-from ampav.core.schema.segments import ParagraphSegment, WordSegment
-from ampav.core.schema.tool import ToolOutput
-from .vi_models import JobStatus, RawVideoIndexer, JobState
-from urllib.parse import urlparse
-import yaml
-import json
 
+from ampav.core.schema.tool import ToolOutput
+from ampav.core.utils import dump_data, load_data, key_finder
+from .models import JobStatus, JobState, ViRawData
+from .vi_parser import parse_vi_data
+from urllib.parse import urlparse
+from ampav.core.schema import load_ampav_file
+from ampav.core.render import render_html
+import json
 
 # chunks shamelessly stolen from 
 # https://github.com/Azure-Samples/azure-video-indexer-samples/blob/master/API-Samples/Python/
-
 
 class AzureVideoIndexer(AsyncTool):
     def __init__(self, vi_subscription_id: str, vi_resource_group: str, 
@@ -122,11 +119,11 @@ class AzureVideoIndexer(AsyncTool):
                                   files={(parsed_url.path.rsplit('/')[-1], f)})            
         else:            
             params['videoUrl'] = video_url
-            print(submit_url, params)
             r = requests.post(submit_url, params=params)
 
         r.raise_for_status()
         job = JobStatus(**r.json())
+        logging.debug(f"Submitted VI job {job.id}")
         return job.id
     
 
@@ -162,7 +159,7 @@ class AzureVideoIndexer(AsyncTool):
                                       status={JobState.UPLOADED: AsyncStatusCode.QUEUED,
                                               JobState.PROCESSING: AsyncStatusCode.IN_PROGRESS,
                                               JobState.PROCESSED: AsyncStatusCode.SUCCEEDED,
-                                              JobState.FAILED: AsyncStatusCode.FAILED}[v.status],
+                                              JobState.FAILED: AsyncStatusCode.FAILED}[v.state],
                                       progress=float(v.processingProgress.replace('%', '')),
                                       message=None))
         return res
@@ -182,7 +179,7 @@ class AzureVideoIndexer(AsyncTool):
         for j in self.list_jobs():
             if j.job_id == job_id:
                 return j
-        return KeyError(f"Job id {job_id} doesn't exist")
+        raise KeyError(f"Job id {job_id} doesn't exist")
     
     
     def get_result(self, job_id: str) -> ToolOutput | None:
@@ -205,8 +202,15 @@ class AzureVideoIndexer(AsyncTool):
             raise ToolError("The job has failed")
         
 
-        # get the video indexer information
-        r = requests.get(url=f"{self.api_url_base}/Videos/{job.job_id}/Index",
+        res = self._fetch(job_id)
+        self.cleanup(job_id)
+        return AzureVideoIndexer.native_to_tool_output(res)
+
+
+    def _fetch(self, job_id: str, artifacts: bool=False) -> dict:
+        """Fetch the raw data from VideoIndexer"""        
+        logging.debug(f"Retrieving results for job {job_id}")
+        r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/Index",
                          params={
                             'accessToken': self._get_access_token(),
                             'language': 'English',
@@ -215,28 +219,41 @@ class AzureVideoIndexer(AsyncTool):
         r.raise_for_status()
         res = {'format': 'viraw',
                'data': r.json(),
-               'thumbnails': {}}
+               'thumbnails': {},
+               'artifacts': {}}
         # look for other artifacts
-        for artifact in ('ocr', 'faces'):
-            r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
-                             params={'type': artifact,
-                                     'accessToken': self._get_access_token()})            
-            if r.status_code == 200:
-                artifact_url = r.text.strip('"')
-                
-                print(f"Found {artifact} artifact at {artifact_url}")
-                r = requests.get(url=artifact_url)
-                print(f"Artifact mime-type: {r.headers['Content-Type']}")
-                try:
-                    res[artifact] = json.loads(r.content)
-                except:
-                    res[artifact] = r.content
+        if artifacts:
+            # There's a lot of good data there, but it's a whole separate
+            # project -- the ThumbNails are zip files, everything has structure
+            # that's not defined in the API, etc.  It's an absolute mess
+            all_artifacts = ['Ocr', 'Faces', 'FacesThumbnails', 'VisualContentModeration', 
+                            'KeyframesThumbnails', 'Emotions', 'TextualContentModeration',
+                            'AudioEffects', 'ObservedPeople', 'Labels', 'Transcript',
+                            'FeaturedClothing', 'ClapperBoards', 'DigitalPatterns',
+                            'TextlessMaterial', 'Logos', 'DetectedObjects']         
+            usable_artifacts = ['Emotions', 'TextualContentModeration', 'Transcript',
+                                'FacesThumbnails']
+            
+            for artifact in all_artifacts:
+                r = requests.get(url=f"{self.api_url_base}/Videos/{job_id}/ArtifactUrl", 
+                                params={'type': artifact,
+                                        'accessToken': self._get_access_token()})            
+                if r.status_code == 200:
+                    artifact_url = r.text.strip('"')
+                    
+                    r = requests.get(url=artifact_url)
+                    try:
+                        res['artifacts'][artifact.lower()] = json.loads(r.content)
+                    except:
+                        res['artifacts'][artifact.lower()] = r.content
+
         # https://api.videoindexer.ai/{location}/Accounts/{accountId}/Videos/{videoId}/Thumbnails/{thumbnailId}
         # find all the thumbnails
+        logging.debug(f"Retrieving thumbnails for {job_id}")
         thumb_base = f"{self.api_url_base}/Videos/{job_id}/Thumbnails"
         for thumbId in set(key_finder(res['data'], 'thumbnailId')):
             r = requests.get(url=f"{thumb_base}/{thumbId}", 
-                             params={'accessToken': self._get_access_token()})            
+                            params={'accessToken': self._get_access_token()})            
             if r.status_code == 200:
                 res['thumbnails'][thumbId] = r.content
             else:
@@ -244,81 +261,13 @@ class AzureVideoIndexer(AsyncTool):
 
         return res
 
+
     @staticmethod
     def native_to_tool_output(native: dict) -> ToolOutput:
         """Convert a native result data structure (such as raw AWS Transcribe
         data) into an AMPAV ToolOutput."""
 
-        tool_output = ToolOutput(tool_name="Azure Video Indexer",
-                                 tool_version="1.0",
-                                 output=CompoundOutput())
-
-
-        # if the data looks like it's a viraw that we're generating internally
-        # we'll use that, otherwise we'll make the raw data (which probably came
-        # directly from AVI) look like what we're generating.
-        if native.get('format', None) != 'viraw':
-            native = {'data': native,
-                      'thumbnails': {}}
-        
-        # Load the speaker names.
-        video = native['data']['video'][0]
-        speakers = {}
-        for speaker in video['insights']['speakers']:
-            speakers[speaker['id']] = speaker['name']
-        
-        # Let's get the transcript first.  AVI gives us the audio in paragraph
-        # style chunks. We'll populate that and then create the rest of the
-        # transcript types from that.        
-        transcript = Transcript(media_duration=hhmmss2seconds(video['insights']['duration']),
-                                languages=video['insights']['languages'])
-                
-        for para in video['insights']['transcript']:
-            # I don't know if AVI ever returns more than one instace per
-            # paragraph, but just to be sure, I'm going to iterate. Also,
-            # I'm using adjusted{Start,End} because that's guaranteed to be
-            # relative to the start of the video.
-            for para_instance in para['instances']:
-                p = ParagraphSegment(start_time=hhmmss2seconds(para_instance['adjustedStart']),
-                                                   end_time=hhmmss2seconds(para_instance['adjustedEnd']),
-                                                   text=para['text'],
-                                                   language=para['language'],
-                                                   speaker=speakers.get(para['speakerId'], "Unknown Speaker"))
-                transcript.paragraphs.append(p)
-
-        # It's really weird the way that AVI returns the paragraphs, so just
-        # to make sure there's not some goofy "They said 'Thank you' 42 times
-        # so we'll bundle it into a single entry", I'm going to sort the 
-        # paragraphs by start time and that should do the trick.
-        transcript.paragraphs = sorted(transcript.paragraphs, key=lambda x: x.start_time) 
-
-        # Paragraphs -> text is pretty easy.
-        transcript.text = " ".join([x.text for x in p])
-
-        # Words is harder...because we have to respect the speaker. Also note
-        # that we don't get word-level timestamps.  I'm going to synthesize them
-        # by chopping them into evenly-spaced chunks.  It's obviously not going
-        # to be right, but it's something that's close.
-        for para in transcript.paragraphs:
-            words = para.text.split()
-            duration = para.duration() / len(words)
-            offset = 0
-            for word in words:
-                transcript.words.append(WordSegment.from_str(word, 
-                                                             start_time=offset, 
-                                                             end_time=offset + duration,
-                                                             speaker=para.speaker,
-                                                             language=para.language))
-                
-        tool_output.output.outputs['transcript'] = transcript
-
-        
-
-
-
-
-    
-        return tool_output
+        return parse_vi_data(native)
 
 
     def cleanup(self, job_id: str) -> None:
@@ -337,34 +286,10 @@ class AzureVideoIndexer(AsyncTool):
         except KeyError:
             return
 
-        logging.info(f"Removing Video Indexer Job {job_id}")
+        logging.debug(f"Removing Video Indexer Job {job_id}")
         video_url = f"{self.api_url_base}/Videos/{job_id}"
         requests.delete(url=video_url,
                         params={'accessToken': self._get_access_token()})
-
-
-        
-
-
-def key_finder(data: Any, key: str) -> list:
-    """Find the values for the given key no matter where
-       it is in the data structure"""
-    res = []
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k == key:
-                res.append(v)
-            else:
-                if isinstance(v, dict):
-                    res.extend(key_finder(v, key))
-                elif isinstance(v, (list, set, tuple)):
-                    for i in v:
-                        res.extend(key_finder(i, key))
-    elif isinstance(data, (set, list, tuple)):
-        for i in data:
-            res.extend(key_finder(i, key))
-
-    return res
 
 
 def main():
@@ -376,7 +301,7 @@ def main():
     parser.add_argument('--azure_client_id', type=str, help='Azure Client ID (default: environment or az login)')
     parser.add_argument('--azure_tenant_id', type=str, help='Azure Tenant ID (default: environment or az login)')
     parser.add_argument('--azure_client_secret', type=str, help='Azure Client Secret (default: environment or az login)')
-    
+        
     subp = parser.add_subparsers(dest="command", help="Sub-commands", required=True)
     cmd = subp.add_parser("list", help="List Video Indexer jobs")
     cmd.add_argument("--format", choices=['yaml', 'json'], default='yaml', help="Output format")
@@ -389,20 +314,43 @@ def main():
     cmd = subp.add_parser("submit", help="Submit a new Video Indexer Job")
     cmd.add_argument("video_url", help="Video URL")
 
-    cmd = subp.add_parser("run", help="Run a new Video Indexer Job and wait for the results")
-    cmd.add_argument("video_url", help="Video URL")
-    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format if waiting")
+    cmd = subp.add_parser("process", help="Run a new Video Indexer Job and wait for the results")
+    cmd.add_argument("video_url", help="Video URL")    
+    cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
+    cmd.add_argument("--output", type=Path, help="Output file")
 
     cmd = subp.add_parser("status", help="Retrive a Video Indexer Job Status")
     cmd.add_argument("job_id", help="Job Id to retrieve")
-    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format")
+    cmd.add_argument("--format", choices=['yaml', 'json'], default='yaml', help="Output format")
 
     cmd = subp.add_parser("retrieve", help="Retrive a Video Indexer Job Result")
     cmd.add_argument("job_id", help="Job Id to retrieve")
-    cmd.add_argument("--format", choices=["yaml", "json"], default="yaml", help="Output Format")
-
+    cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
+    cmd.add_argument("--output", type=Path, help="Output file")
+    
+    cmd = subp.add_parser("fetchraw", help="Fetch the raw videoindexer output (for debugging only)")
+    cmd.add_argument("job_id", help="Job Id to dump")
+    cmd.add_argument("--format", choices=['yaml', 'pickle'], default='yaml', help="Output format")
+    cmd.add_argument("--output", type=Path, help="Output file")
+    cmd.add_argument("--artifacts", action="store_true", help="Attach additional artifacts")
+    
     cmd = subp.add_parser("parseraw", help="Parse a raw videoindexer output to ampav objects")
-    cmd.add_argument("rawfile", help="Raw file data")
+    cmd.add_argument("rawfile", type=Path, help="Raw file data")
+    cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
+    cmd.add_argument("--output", type=Path, help="Output file")
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+
+    cmd = subp.add_parser("render", help="Render an AMPAV AVI tool output into html")
+    cmd.add_argument("input", type=Path, help="AMPAV AVI Tool output")
+    cmd.add_argument("output", type=Path, help="Rendered HTML output file")
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+    cmd.add_argument("--raw", action="store_true", help="Load non-AMPAV data")
+
+    cmd = subp.add_parser("convert", help="Convert from one format to another")
+    cmd.add_argument("input", type=Path, help="Data file")
+    cmd.add_argument("output", type=Path, help="Rendered HTML output file")
+    cmd.add_argument("--allow_pickle", action='store_true', help="Enable pickle loading")
+    cmd.add_argument("--format", choices=['yaml', 'json', 'pickle'], default='yaml', help="Output format")
 
     args = parser.parse_args()
 
@@ -426,10 +374,7 @@ def main():
             out = {}
             for k, v in vi._jobs().items():
                 out[k] = v.model_dump()
-            if args.format == "yaml":
-                print(yaml.safe_dump(out))
-            else:
-                print(json.dumps(out))
+            dump_data(out, args.format, None)
 
         case "delete":
             vi.cleanup(args.job_id)
@@ -442,39 +387,75 @@ def main():
             job_id = vi.submit(args.video_url)        
             print(job_id)
 
-        case "run":
-            result = vi.run(args.video_url)
+        case "process":
+            # capture logging to an array
+            logs = []
+            loghandler = ListLoggingHandler(logs)
+            logging.getLogger().addHandler(loghandler)
+            
+            # run the job
+            logging.info("Starting processing")
+            start = time.time()
+            result = vi.process(args.video_url)
 
-            if args.format == "yaml":
-                print(yaml.safe_dump(result))
-            else:
-                print(json.dumps(result))
+            # update the tool_output structure with the runtime things            
+            result.start_time = start
+            result.end_time = time.time()            
+            result.parameters['url'] = args.video_url
+
+            # return the result to the user
+            logging.info("Saving data")
+            result.messages = logs
+            dump_data(result, args.format, args.output)
                         
         case "status":
             result = vi.get_status(args.job_id)
-            if args.format == "yaml":
-                print(yaml.safe_dump(result.model_dump()))
-            else:
-                print(json.dumps(result.model_dump()))            
+            dump_data(result, args.format, None)
 
         case "retrieve":
             result = vi.get_result(args.job_id)
             if result is None:
                 logging.info("The job is not ready yet")
             else:
-                if args.format == "yaml":
-                    print(yaml.safe_dump(result))
-                else:
-                    print(json.dumps(result))            
+                dump_data(result, args.format, args.output)
 
-        case "parseraw":
-            AmpAVBaseModel.model_config = ConfigDict(extra="forbid")
-            with open(args.rawfile) as f:
-                data = yaml.safe_load(f)
-            
-            print(key_finder(data, 'thumbnailId'))
-            vidata = RawVideoIndexer(**data)
-            print(vidata.model_dump_yaml())
+        case "fetchraw":
+            logging.info("Requesting results")
+            job: AsyncJobStatus = vi.get_status(args.job_id)
+            if job.status != AsyncStatusCode.SUCCEEDED:
+                logging.warning(f"Cannot fetch data as the job is in state {job.status}")
+                exit(1)
+            result = vi._fetch(args.job_id, args.artifacts)            
+            logging.info("Got the results.")
+            dump_data(result, args.format, args.output)
+            logging.info("Finished writing data")
+
+        case "parseraw":          
+            logging.info("Loading the data")
+            data = load_data(args.rawfile, args.allow_pickle)
+            if isinstance(data, dict):
+                data = ViRawData(**data)
+            logging.info("Processing the data")
+            vidata = AzureVideoIndexer.native_to_tool_output(data.model_dump())
+            logging.info("Writing the output")
+            dump_data(vidata, args.format, args.output)
+            logging.info("Output finished")
+
+        case "render":
+            logging.info("Loading data")
+            if args.raw:
+                with open(args.input) as f:
+                    data = yaml.safe_load(f)
+            else:
+                data: ToolOutput = load_ampav_file(args.input, args.allow_pickle)
+            logging.info("Rendering data")
+            args.output.write_text(render_html(data, args.input.name))
+
+        case "convert":
+            logging.info("Loading data.")
+            data = load_data(args.input, args.allow_pickle)
+            logging.info("Saving data.")
+            dump_data(data, args.format, args.output)
 
 
 if __name__ == "__main__":

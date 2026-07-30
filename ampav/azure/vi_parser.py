@@ -184,7 +184,7 @@ def do_brands(media_info: MediaInfo, insights: dict, src_key: str, outputs: dict
                                 confidence=item['confidence'],
                                 tool_private={'instanceSource': inst['instanceSource']},
                                 text=item['name'],
-                                entity_type=differences[src_key][0],
+                                label=differences[src_key][0],
                                 type=differences[src_key][1])
             for k in ('description', 'referenceId', 'referenceType', 'referenceUri'):
                 if k in item:
@@ -339,7 +339,7 @@ def do_named_locations(media_info: MediaInfo, insights: dict, src_key: str, outp
                                               'referenceId': item['referenceId'],                                              
                                               'referenceUrl': item['referenceUrl']},
                                 text=item['name'],
-                                entity_type="namedLocation",
+                                label="namedLocation",
                                 type=NamedEntityType.LOCATION)            
             res.append(linst)
     if res:

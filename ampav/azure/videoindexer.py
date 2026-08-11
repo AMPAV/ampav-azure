@@ -202,7 +202,7 @@ class AzureVideoIndexer(AsyncTool):
             raise ToolError("The job has failed")
         
 
-        res = self._fetch(job_id)
+        res = self._fetch(job_id, artifacts=True)
         self.cleanup(job_id)
         return AzureVideoIndexer.native_to_tool_output(res)
 

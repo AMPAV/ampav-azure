@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 from ampav.core.schema import load_ampav_file
 from ampav.core.render import render_html
 import json
+from . import __version__
 
 # chunks shamelessly stolen from 
 # https://github.com/Azure-Samples/azure-video-indexer-samples/blob/master/API-Samples/Python/
@@ -294,6 +295,7 @@ class AzureVideoIndexer(AsyncTool):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--debug", action='store_true', help="Turn on debug logging")
     parser.add_argument('--vi_account_name', type=str, help="VideoIndexer Account Name (default: environment)")
     parser.add_argument('--vi_subscription_id', type=str, help='VideoIndexer Subscription ID (default: environment)')

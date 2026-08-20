@@ -19,6 +19,7 @@ from ampav.core.schema.image import BoundingBox, Image
 import PIL.Image
 import logging
 from collections import namedtuple
+from . import __version__
 
 
 # Setting up the thumbnail cache here to make image instantiation faster.
@@ -42,7 +43,7 @@ MediaInfo = namedtuple('MediaInfo', ['duration', 'width', 'height'])
     
 def parse_vi_data(native: dict):
     tool_output = ToolOutput(tool_name="Azure Video Indexer",
-                                tool_version="1.0",
+                                tool_version=__version__,
                                 output=CompoundOutput())
 
 

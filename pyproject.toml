@@ -1,6 +1,6 @@
 [project]
 name = "ampav-azure"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Azure tooling for the AMPAV environment"
 readme = "README.md"
 license = "Apache-2.0"
@@ -30,3 +30,6 @@ ampav_azure_video_indexer = "ampav.azure.videoindexer:main"
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "ampav.azure.__version__"}
